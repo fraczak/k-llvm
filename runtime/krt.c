@@ -1,0 +1,146 @@
+#include "krt.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+typedef enum {
+  K_VALUE_UNIT,
+  K_VALUE_PRODUCT,
+  K_VALUE_VARIANT
+} k_value_kind;
+
+typedef struct {
+  char *label;
+  k_value *value;
+} k_field;
+
+struct k_value {
+  k_value_kind kind;
+  struct k_value *next;
+  union {
+    struct {
+      size_t count;
+      size_t capacity;
+      k_field *fields;
+    } product;
+    struct {
+      char *tag;
+      k_value *payload;
+    } variant;
+  } as;
+};
+
+struct k_rt {
+  k_value *values;
+};
+
+static char *k_strdup(const char *text) {
+  size_t length = strlen(text);
+  char *copy = malloc(length + 1);
+  if (copy == NULL) abort();
+  memcpy(copy, text, length + 1);
+  return copy;
+}
+
+static k_value *alloc_value(k_rt *rt, k_value_kind kind) {
+  if (rt == NULL) return NULL;
+  k_value *value = calloc(1, sizeof(k_value));
+  if (value == NULL) abort();
+  value->kind = kind;
+  value->next = rt->values;
+  rt->values = value;
+  return value;
+}
+
+k_rt *k_rt_new(void) {
+  return calloc(1, sizeof(k_rt));
+}
+
+void k_rt_free(k_rt *rt) {
+  if (rt == NULL) return;
+  k_value *value = rt->values;
+  while (value != NULL) {
+    k_value *next = value->next;
+    if (value->kind == K_VALUE_PRODUCT) {
+      for (size_t i = 0; i < value->as.product.count; i++) {
+        free(value->as.product.fields[i].label);
+      }
+      free(value->as.product.fields);
+    } else if (value->kind == K_VALUE_VARIANT) {
+      free(value->as.variant.tag);
+    }
+    free(value);
+    value = next;
+  }
+  free(rt);
+}
+
+k_value *k_unit(k_rt *rt) {
+  return alloc_value(rt, K_VALUE_UNIT);
+}
+
+k_value *k_product(k_rt *rt, size_t count) {
+  k_value *product = alloc_value(rt, K_VALUE_PRODUCT);
+  if (product == NULL) return NULL;
+  product->as.product.capacity = count;
+  if (count > 0) {
+    product->as.product.fields = calloc(count, sizeof(k_field));
+    if (product->as.product.fields == NULL) abort();
+  }
+  return product;
+}
+
+void k_product_set(k_value *product, const char *label, k_value *value) {
+  if (product == NULL || product->kind != K_VALUE_PRODUCT || label == NULL) return;
+  for (size_t i = 0; i < product->as.product.count; i++) {
+    if (strcmp(product->as.product.fields[i].label, label) == 0) {
+      product->as.product.fields[i].value = value;
+      return;
+    }
+  }
+
+  if (product->as.product.count == product->as.product.capacity) {
+    size_t capacity = product->as.product.capacity == 0 ? 1 : product->as.product.capacity * 2;
+    k_field *fields = realloc(product->as.product.fields, capacity * sizeof(k_field));
+    if (fields == NULL) abort();
+    product->as.product.fields = fields;
+    product->as.product.capacity = capacity;
+  }
+
+  size_t index = product->as.product.count++;
+  product->as.product.fields[index].label = k_strdup(label);
+  product->as.product.fields[index].value = value;
+}
+
+k_value *k_product_get(k_value *product, const char *label) {
+  if (product == NULL || product->kind != K_VALUE_PRODUCT || label == NULL) return NULL;
+  for (size_t i = 0; i < product->as.product.count; i++) {
+    if (strcmp(product->as.product.fields[i].label, label) == 0) {
+      return product->as.product.fields[i].value;
+    }
+  }
+  return NULL;
+}
+
+k_value *k_variant(k_rt *rt, const char *tag, k_value *payload) {
+  if (tag == NULL) return NULL;
+  k_value *variant = alloc_value(rt, K_VALUE_VARIANT);
+  if (variant == NULL) return NULL;
+  variant->as.variant.tag = k_strdup(tag);
+  variant->as.variant.payload = payload;
+  return variant;
+}
+
+const char *k_variant_tag(k_value *value) {
+  if (value == NULL || value->kind != K_VALUE_VARIANT) return NULL;
+  return value->as.variant.tag;
+}
+
+k_value *k_variant_payload(k_value *value) {
+  if (value == NULL || value->kind != K_VALUE_VARIANT) return NULL;
+  return value->as.variant.payload;
+}
+
+int k_equal(k_value *a, k_value *b) {
+  return a == b;
+}

@@ -23,9 +23,18 @@ node ../k.kir/objects/compile.mjs '()' /tmp/id.ko
 node ./bin/k-llvm-compile.mjs --input-pattern '[["open-product",[]]]' /tmp/id.ko /tmp/id.ll
 ```
 
-The generated `.ll` is a prototype artifact. It embeds the KIR-R JSON as module
-data and provides a placeholder `@k_main` function so downstream LLVM tooling
-has a concrete module to inspect.
+The generated `.ll` embeds the KIR-R JSON as module data and exposes the first
+runtime ABI slice:
+
+```llvm
+%k_result = type { i32, ptr }
+
+define %k_result @k_main(ptr %rt, ptr %input)
+```
+
+`%rt` is an opaque runtime handle and `%input` is an opaque boxed `k_value*`.
+The first executable lowering supports identity KIR. Unsupported operations
+return a nonzero status in `k_result`.
 
 ## CLI
 
@@ -48,10 +57,34 @@ Current output:
 
 - KIR-R specialization through `@fraczak/k/backend-api.mjs`;
 - textual LLVM IR with embedded KIR-R JSON;
-- placeholder `@k_main(i32) -> i32`.
+- boxed runtime ABI declarations;
+- identity lowering as `@k_main(k_rt*, k_value*) -> k_result`;
+- a tiny C runtime under `runtime/`.
 
 Next backend steps:
 
-- define a real value ABI;
-- lower KIR-R/KIR-M operations into LLVM functions;
+- lower product field access and construction;
+- lower variant tag/payload operations;
+- lower filters and relation calls;
 - add an executable conformance mode once the runtime ABI exists.
+
+## Runtime ABI
+
+The C side owns all runtime allocation:
+
+```c
+typedef struct k_rt k_rt;
+typedef struct k_value k_value;
+
+typedef struct {
+  int32_t status;
+  k_value *value;
+} k_result;
+
+k_result k_main(k_rt *rt, k_value *input);
+```
+
+`runtime/krt.h` provides the initial boxed helpers for units, products,
+variants, and pointer equality. The representation is intentionally opaque so
+future KIR specialization can add unboxed fast paths without changing the
+external ABI.

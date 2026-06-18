@@ -32,6 +32,35 @@ export function llvmIdentifier(name) {
   return String(name || "main").replace(/[^A-Za-z0-9_$.-]/g, "_");
 }
 
+function runtimeDeclarations() {
+  return [
+    "%k_result = type { i32, ptr }",
+    "",
+    "declare ptr @k_unit(ptr)",
+    "declare ptr @k_product(ptr, i64)",
+    "declare void @k_product_set(ptr, ptr, ptr)",
+    "declare ptr @k_product_get(ptr, ptr)",
+    "declare ptr @k_variant(ptr, ptr, ptr)",
+    "declare ptr @k_variant_tag(ptr)",
+    "declare ptr @k_variant_payload(ptr)",
+    "declare i32 @k_equal(ptr, ptr)"
+  ];
+}
+
+function result(status, value = "null") {
+  return [
+    `  %status = insertvalue %k_result undef, i32 ${status}, 0`,
+    `  %result = insertvalue %k_result %status, ptr ${value}, 1`,
+    "  ret %k_result %result"
+  ];
+}
+
+function lowerEntryBody(kirR) {
+  const body = kirR.entry?.body;
+  if (body?.op === "identity") return result(0, "%input");
+  return result(1);
+}
+
 export function emitLLVMModule(kirR, options = {}) {
   const payload = JSON.stringify({
     format: ARTIFACT_FORMAT,
@@ -51,9 +80,11 @@ export function emitLLVMModule(kirR, options = {}) {
     "",
     `@k_llvm_metadata = private unnamed_addr constant [${payloadBytes} x i8] c"${cStringBytes(payload)}", align 1`,
     "",
-    "define i32 @k_main(i32 %input) {",
+    ...runtimeDeclarations(),
+    "",
+    "define %k_result @k_main(ptr %rt, ptr %input) {",
     "entry:",
-    "  ret i32 %input",
+    ...lowerEntryBody(kirR),
     "}",
     ""
   ].join("\n");
