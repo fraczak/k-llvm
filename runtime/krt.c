@@ -1,7 +1,12 @@
 #include "krt.h"
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+
+enum {
+  K_ARENA_BLOCK_SIZE = 262144
+};
 
 typedef enum {
   K_VALUE_UNIT,
@@ -11,12 +16,20 @@ typedef enum {
 
 typedef struct {
   char *label;
+  size_t label_length;
   k_value *value;
 } k_field;
 
+typedef struct k_arena_block {
+  struct k_arena_block *next;
+  size_t used;
+  size_t capacity;
+  unsigned char data[];
+} k_arena_block;
+
 struct k_value {
   k_value_kind kind;
-  struct k_value *next;
+  k_rt *rt;
   union {
     struct {
       size_t count;
@@ -25,30 +38,113 @@ struct k_value {
     } product;
     struct {
       char *tag;
+      size_t tag_length;
       k_value *payload;
     } variant;
   } as;
 };
 
 struct k_rt {
-  k_value *values;
+  k_arena_block *blocks;
+  k_value *unit_cache;
+  k_value *bit0_cache;
+  k_value *bit1_cache;
 };
 
-static char *k_strdup(const char *text) {
-  size_t length = strlen(text);
+static size_t align_size(size_t size) {
+  size_t alignment = sizeof(max_align_t);
+  return (size + alignment - 1) & ~(alignment - 1);
+}
+
+static k_arena_block *reuse_arena_block(k_rt *rt, size_t size) {
+  k_arena_block **link = rt == NULL || rt->blocks == NULL ? NULL : &rt->blocks->next;
+  while (link != NULL && *link != NULL) {
+    k_arena_block *block = *link;
+    if (block->capacity - block->used >= size) {
+      *link = block->next;
+      block->next = rt->blocks;
+      rt->blocks = block;
+      return block;
+    }
+    link = &block->next;
+  }
+  return NULL;
+}
+
+static void *rt_alloc(k_rt *rt, size_t size) {
+  if (rt == NULL) return NULL;
+  size = align_size(size == 0 ? 1 : size);
+  k_arena_block *block = rt->blocks;
+  if (block == NULL || block->capacity - block->used < size) {
+    block = reuse_arena_block(rt, size);
+    if (block == NULL) {
+      size_t capacity = size > K_ARENA_BLOCK_SIZE ? size : K_ARENA_BLOCK_SIZE;
+      block = malloc(sizeof(k_arena_block) + capacity);
+      if (block == NULL) abort();
+      block->next = rt->blocks;
+      block->used = 0;
+      block->capacity = capacity;
+      rt->blocks = block;
+    }
+  }
+  void *ptr = block->data + block->used;
+  block->used += size;
+  return ptr;
+}
+
+static void *rt_zalloc(k_rt *rt, size_t count, size_t size) {
+  if (count != 0 && size > ((size_t)-1) / count) abort();
+  size_t bytes = count * size;
+  void *ptr = rt_alloc(rt, bytes);
+  if (ptr == NULL) return NULL;
+  memset(ptr, 0, bytes);
+  return ptr;
+}
+
+static char *rt_memdup_text(k_rt *rt, const char *text, size_t length) {
+  char *copy = rt_alloc(rt, length + 1);
+  if (copy == NULL) abort();
+  if (length > 0) memcpy(copy, text, length);
+  copy[length] = 0;
+  return copy;
+}
+
+static char *heap_memdup_text(const char *text, size_t length) {
   char *copy = malloc(length + 1);
   if (copy == NULL) abort();
-  memcpy(copy, text, length + 1);
+  if (length > 0) memcpy(copy, text, length);
+  copy[length] = 0;
   return copy;
+}
+
+static int bytes_equal(const char *a, size_t a_length, const char *b, size_t b_length) {
+  if (a_length != b_length) return 0;
+  if (a == b) return 1;
+  return a_length == 0 || memcmp(a, b, a_length) == 0;
+}
+
+static int is_empty_product(k_value *value);
+
+static int numeric_label_index(const char *label, size_t label_length, size_t *out) {
+  if (label == NULL || label_length == 0) return 0;
+  size_t value = 0;
+  for (size_t i = 0; i < label_length; i++) {
+    unsigned char ch = (unsigned char)label[i];
+    if (ch < '0' || ch > '9') return 0;
+    size_t digit = (size_t)(ch - '0');
+    if (value > (((size_t)-1) - digit) / 10) return 0;
+    value = value * 10 + digit;
+  }
+  *out = value;
+  return 1;
 }
 
 static k_value *alloc_value(k_rt *rt, k_value_kind kind) {
   if (rt == NULL) return NULL;
-  k_value *value = calloc(1, sizeof(k_value));
+  k_value *value = rt_zalloc(rt, 1, sizeof(k_value));
   if (value == NULL) abort();
   value->kind = kind;
-  value->next = rt->values;
-  rt->values = value;
+  value->rt = rt;
   return value;
 }
 
@@ -56,27 +152,37 @@ k_rt *k_rt_new(void) {
   return calloc(1, sizeof(k_rt));
 }
 
+void k_rt_reset(k_rt *rt) {
+  if (rt == NULL) return;
+  for (k_arena_block *block = rt->blocks; block != NULL; block = block->next) {
+    block->used = 0;
+  }
+  rt->unit_cache = NULL;
+  rt->bit0_cache = NULL;
+  rt->bit1_cache = NULL;
+}
+
 void k_rt_free(k_rt *rt) {
   if (rt == NULL) return;
-  k_value *value = rt->values;
-  while (value != NULL) {
-    k_value *next = value->next;
-    if (value->kind == K_VALUE_PRODUCT) {
-      for (size_t i = 0; i < value->as.product.count; i++) {
-        free(value->as.product.fields[i].label);
-      }
-      free(value->as.product.fields);
-    } else if (value->kind == K_VALUE_VARIANT) {
-      free(value->as.variant.tag);
-    }
-    free(value);
-    value = next;
+  k_arena_block *block = rt->blocks;
+  while (block != NULL) {
+    k_arena_block *next = block->next;
+    free(block);
+    block = next;
   }
   free(rt);
 }
 
 k_value *k_unit(k_rt *rt) {
-  return alloc_value(rt, K_VALUE_UNIT);
+  if (rt == NULL) return NULL;
+  if (rt->unit_cache != NULL) return rt->unit_cache;
+  k_value *unit = alloc_value(rt, K_VALUE_PRODUCT);
+  if (unit == NULL) return NULL;
+  unit->as.product.count = 0;
+  unit->as.product.capacity = 0;
+  unit->as.product.fields = NULL;
+  rt->unit_cache = unit;
+  return unit;
 }
 
 k_value *k_product(k_rt *rt, size_t count) {
@@ -84,16 +190,49 @@ k_value *k_product(k_rt *rt, size_t count) {
   if (product == NULL) return NULL;
   product->as.product.capacity = count;
   if (count > 0) {
-    product->as.product.fields = calloc(count, sizeof(k_field));
+    product->as.product.fields = rt_zalloc(rt, count, sizeof(k_field));
     if (product->as.product.fields == NULL) abort();
   }
   return product;
 }
 
-void k_product_set(k_value *product, const char *label, k_value *value) {
-  if (product == NULL || product->kind != K_VALUE_PRODUCT || label == NULL) return;
+k_value *k_product_get_n(k_value *product, const char *label, size_t label_length) {
+  if (product == NULL || product->kind != K_VALUE_PRODUCT || label == NULL) return NULL;
+  size_t index = 0;
+  if (numeric_label_index(label, label_length, &index) && index < product->as.product.count) {
+    k_field *field = &product->as.product.fields[index];
+    if (bytes_equal(field->label, field->label_length, label, label_length)) return field->value;
+  }
   for (size_t i = 0; i < product->as.product.count; i++) {
-    if (strcmp(product->as.product.fields[i].label, label) == 0) {
+    if (bytes_equal(product->as.product.fields[i].label, product->as.product.fields[i].label_length, label, label_length)) {
+      return product->as.product.fields[i].value;
+    }
+  }
+  return NULL;
+}
+
+static void k_product_set_internal(k_value *product, const char *label, size_t label_length, k_value *value, int borrow_label) {
+  if (product == NULL || product->kind != K_VALUE_PRODUCT || label == NULL) return;
+  size_t numeric_index = 0;
+  if (numeric_label_index(label, label_length, &numeric_index) &&
+      numeric_index < product->as.product.capacity &&
+      numeric_index <= product->as.product.count) {
+    k_field *field = &product->as.product.fields[numeric_index];
+    if (numeric_index == product->as.product.count) {
+      field->label = borrow_label ? (char *)label : rt_memdup_text(product->rt, label, label_length);
+      field->label_length = label_length;
+      field->value = value;
+      product->as.product.count++;
+      return;
+    }
+    if (bytes_equal(field->label, field->label_length, label, label_length)) {
+      field->value = value;
+      return;
+    }
+  }
+
+  for (size_t i = 0; i < product->as.product.count; i++) {
+    if (bytes_equal(product->as.product.fields[i].label, product->as.product.fields[i].label_length, label, label_length)) {
       product->as.product.fields[i].value = value;
       return;
     }
@@ -101,39 +240,86 @@ void k_product_set(k_value *product, const char *label, k_value *value) {
 
   if (product->as.product.count == product->as.product.capacity) {
     size_t capacity = product->as.product.capacity == 0 ? 1 : product->as.product.capacity * 2;
-    k_field *fields = realloc(product->as.product.fields, capacity * sizeof(k_field));
+    k_field *fields = rt_zalloc(product->rt, capacity, sizeof(k_field));
     if (fields == NULL) abort();
+    if (product->as.product.count > 0) {
+      memcpy(fields, product->as.product.fields, product->as.product.count * sizeof(k_field));
+    }
     product->as.product.fields = fields;
     product->as.product.capacity = capacity;
   }
 
   size_t index = product->as.product.count++;
-  product->as.product.fields[index].label = k_strdup(label);
+  product->as.product.fields[index].label = borrow_label ? (char *)label : rt_memdup_text(product->rt, label, label_length);
+  product->as.product.fields[index].label_length = label_length;
   product->as.product.fields[index].value = value;
 }
 
+void k_product_set_n(k_value *product, const char *label, size_t label_length, k_value *value) {
+  k_product_set_internal(product, label, label_length, value, 0);
+}
+
+void k_product_set_borrowed_n(k_value *product, const char *label, size_t label_length, k_value *value) {
+  k_product_set_internal(product, label, label_length, value, 1);
+}
+
+void k_product_set(k_value *product, const char *label, k_value *value) {
+  if (label == NULL) return;
+  k_product_set_n(product, label, strlen(label), value);
+}
+
 k_value *k_product_get(k_value *product, const char *label) {
-  if (product == NULL || product->kind != K_VALUE_PRODUCT || label == NULL) return NULL;
-  for (size_t i = 0; i < product->as.product.count; i++) {
-    if (strcmp(product->as.product.fields[i].label, label) == 0) {
-      return product->as.product.fields[i].value;
-    }
+  if (label == NULL) return NULL;
+  return k_product_get_n(product, label, strlen(label));
+}
+
+static k_value *k_variant_internal(k_rt *rt, const char *tag, size_t tag_length, k_value *payload, int borrow_tag) {
+  if (tag == NULL) return NULL;
+  if (rt != NULL && tag_length == 1 && is_empty_product(payload) && (tag[0] == '0' || tag[0] == '1')) {
+    k_value **cache = tag[0] == '0' ? &rt->bit0_cache : &rt->bit1_cache;
+    if (*cache != NULL) return *cache;
+    k_value *variant = alloc_value(rt, K_VALUE_VARIANT);
+    if (variant == NULL) return NULL;
+    variant->as.variant.tag = tag[0] == '0' ? "0" : "1";
+    variant->as.variant.tag_length = 1;
+    variant->as.variant.payload = k_unit(rt);
+    *cache = variant;
+    return variant;
   }
-  return NULL;
+  k_value *variant = alloc_value(rt, K_VALUE_VARIANT);
+  if (variant == NULL) return NULL;
+  variant->as.variant.tag = borrow_tag ? (char *)tag : rt_memdup_text(rt, tag, tag_length);
+  variant->as.variant.tag_length = tag_length;
+  variant->as.variant.payload = payload;
+  return variant;
+}
+
+k_value *k_variant_n(k_rt *rt, const char *tag, size_t tag_length, k_value *payload) {
+  return k_variant_internal(rt, tag, tag_length, payload, 0);
+}
+
+k_value *k_variant_borrowed_n(k_rt *rt, const char *tag, size_t tag_length, k_value *payload) {
+  return k_variant_internal(rt, tag, tag_length, payload, 1);
 }
 
 k_value *k_variant(k_rt *rt, const char *tag, k_value *payload) {
   if (tag == NULL) return NULL;
-  k_value *variant = alloc_value(rt, K_VALUE_VARIANT);
-  if (variant == NULL) return NULL;
-  variant->as.variant.tag = k_strdup(tag);
-  variant->as.variant.payload = payload;
-  return variant;
+  return k_variant_n(rt, tag, strlen(tag), payload);
 }
 
 const char *k_variant_tag(k_value *value) {
   if (value == NULL || value->kind != K_VALUE_VARIANT) return NULL;
   return value->as.variant.tag;
+}
+
+size_t k_variant_tag_length(k_value *value) {
+  if (value == NULL || value->kind != K_VALUE_VARIANT) return 0;
+  return value->as.variant.tag_length;
+}
+
+int k_variant_tag_matches(k_value *value, const char *tag, size_t tag_length) {
+  if (value == NULL || value->kind != K_VALUE_VARIANT || tag == NULL) return 0;
+  return bytes_equal(value->as.variant.tag, value->as.variant.tag_length, tag, tag_length);
 }
 
 k_value *k_variant_payload(k_value *value) {
@@ -149,14 +335,14 @@ int k_equal(k_value *a, k_value *b) {
   if (a->kind == K_VALUE_UNIT) return 1;
 
   if (a->kind == K_VALUE_VARIANT) {
-    return strcmp(a->as.variant.tag, b->as.variant.tag) == 0 &&
+    return bytes_equal(a->as.variant.tag, a->as.variant.tag_length, b->as.variant.tag, b->as.variant.tag_length) &&
       k_equal(a->as.variant.payload, b->as.variant.payload);
   }
 
   if (a->kind == K_VALUE_PRODUCT) {
     if (a->as.product.count != b->as.product.count) return 0;
     for (size_t i = 0; i < a->as.product.count; i++) {
-      k_value *b_field = k_product_get(b, a->as.product.fields[i].label);
+      k_value *b_field = k_product_get_n(b, a->as.product.fields[i].label, a->as.product.fields[i].label_length);
       if (!k_equal(a->as.product.fields[i].value, b_field)) return 0;
     }
     return 1;
@@ -171,10 +357,11 @@ static int is_empty_product(k_value *value) {
     value->as.product.count == 0;
 }
 
-static void print_json_string(FILE *out, const char *text) {
+static void print_json_string_n(FILE *out, const char *text, size_t length) {
   fputc('"', out);
-  for (const unsigned char *p = (const unsigned char *)text; *p != 0; p++) {
-    switch (*p) {
+  for (size_t i = 0; i < length; i++) {
+    unsigned char ch = (unsigned char)text[i];
+    switch (ch) {
       case '"':
         fputs("\\\"", out);
         break;
@@ -197,15 +384,19 @@ static void print_json_string(FILE *out, const char *text) {
         fputs("\\t", out);
         break;
       default:
-        if (*p < 0x20) {
-          fprintf(out, "\\u%04x", *p);
+        if (ch < 0x20) {
+          fprintf(out, "\\u%04x", ch);
         } else {
-          fputc(*p, out);
+          fputc(ch, out);
         }
         break;
     }
   }
   fputc('"', out);
+}
+
+static void print_json_string(FILE *out, const char *text) {
+  print_json_string_n(out, text, strlen(text));
 }
 
 void k_print_json(FILE *out, k_value *value) {
@@ -223,7 +414,7 @@ void k_print_json(FILE *out, k_value *value) {
     fputc('{', out);
     for (size_t i = 0; i < value->as.product.count; i++) {
       if (i > 0) fputc(',', out);
-      print_json_string(out, value->as.product.fields[i].label);
+      print_json_string_n(out, value->as.product.fields[i].label, value->as.product.fields[i].label_length);
       fputc(':', out);
       k_print_json(out, value->as.product.fields[i].value);
     }
@@ -233,11 +424,11 @@ void k_print_json(FILE *out, k_value *value) {
 
   if (value->kind == K_VALUE_VARIANT) {
     if (is_empty_product(value->as.variant.payload)) {
-      print_json_string(out, value->as.variant.tag);
+      print_json_string_n(out, value->as.variant.tag, value->as.variant.tag_length);
       return;
     }
     fputc('{', out);
-    print_json_string(out, value->as.variant.tag);
+    print_json_string_n(out, value->as.variant.tag, value->as.variant.tag_length);
     fputc(':', out);
     k_print_json(out, value->as.variant.payload);
     fputc('}', out);
@@ -261,55 +452,33 @@ typedef struct {
   int ok;
 } bit_writer;
 
-typedef struct {
-  const char *label;
-  size_t target;
-} k_pattern_edge;
+#define K_PATTERN_EDGE(label, target) {label, sizeof(label) - 1, target}
 
-typedef struct {
-  int kind;
-  size_t edge_count;
-  k_pattern_edge *edges;
-} k_pattern_node;
-
-typedef struct {
-  size_t node_count;
-  k_pattern_node *nodes;
-} k_pattern;
-
-enum {
-  KP_ANY,
-  KP_OPEN_PRODUCT,
-  KP_OPEN_UNION,
-  KP_CLOSED_PRODUCT,
-  KP_CLOSED_UNION
-};
-
-static k_pattern_edge core_edges_0[] = {{"cons", 1}, {"nil", 3}};
-static k_pattern_edge core_edges_1[] = {{"car", 2}, {"cdr", 0}};
-static k_pattern_edge core_edges_2[] = {{"any", 3}, {"closed-product", 4}, {"closed-union", 4}, {"open-product", 4}, {"open-union", 4}};
-static k_pattern_edge core_edges_4[] = {{"cons", 5}, {"nil", 3}};
-static k_pattern_edge core_edges_5[] = {{"car", 6}, {"cdr", 4}};
-static k_pattern_edge core_edges_6[] = {{"label", 7}, {"target", 25}};
-static k_pattern_edge core_edges_7[] = {{"cons", 8}, {"nil", 3}};
-static k_pattern_edge core_edges_8[] = {{"car", 9}, {"cdr", 7}};
-static k_pattern_edge core_edges_9[] = {{"ascii", 10}, {"bmp_common", 12}, {"bmp_private_use", 17}, {"plane0", 20}, {"supplementary_plane1", 21}, {"supplementary_planes2_16", 22}};
-static k_pattern_edge core_edges_10[] = {{"0", 11}, {"1", 11}, {"2", 11}, {"3", 11}, {"4", 11}, {"5", 11}, {"6", 11}};
-static k_pattern_edge core_edges_11[] = {{"0", 3}, {"1", 3}};
-static k_pattern_edge core_edges_12[] = {{"hi", 13}, {"lo", 16}};
-static k_pattern_edge core_edges_13[] = {{"h08_0F", 14}, {"h10_7F", 10}, {"h80_CF", 10}, {"hD0_D7", 14}, {"hF9", 3}, {"hFA_FB", 15}, {"hFC_FD", 15}, {"hFE_FF", 15}};
-static k_pattern_edge core_edges_14[] = {{"0", 11}, {"1", 11}, {"2", 11}};
-static k_pattern_edge core_edges_15[] = {{"0", 11}};
-static k_pattern_edge core_edges_16[] = {{"0", 11}, {"1", 11}, {"2", 11}, {"3", 11}, {"4", 11}, {"5", 11}, {"6", 11}, {"7", 11}};
-static k_pattern_edge core_edges_17[] = {{"hi", 18}, {"lo", 16}};
-static k_pattern_edge core_edges_18[] = {{"hE0_EF", 19}, {"hF0_F7", 14}, {"hF8", 3}};
-static k_pattern_edge core_edges_19[] = {{"0", 11}, {"1", 11}, {"2", 11}, {"3", 11}};
-static k_pattern_edge core_edges_20[] = {{"0", 11}, {"1", 11}, {"10", 11}, {"2", 11}, {"3", 11}, {"4", 11}, {"5", 11}, {"6", 11}, {"7", 11}, {"8", 11}, {"9", 11}};
-static k_pattern_edge core_edges_21[] = {{"lo", 16}, {"mid", 16}};
-static k_pattern_edge core_edges_22[] = {{"lo", 16}, {"mid", 16}, {"plane", 23}};
-static k_pattern_edge core_edges_23[] = {{"p02_03", 15}, {"p04_07", 24}, {"p08_0F", 14}, {"p10", 3}};
-static k_pattern_edge core_edges_24[] = {{"0", 11}, {"1", 11}};
-static k_pattern_edge core_edges_25[] = {{"0", 25}, {"1", 25}, {"_", 3}};
+static k_pattern_edge core_edges_0[] = {K_PATTERN_EDGE("cons", 1), K_PATTERN_EDGE("nil", 3)};
+static k_pattern_edge core_edges_1[] = {K_PATTERN_EDGE("car", 2), K_PATTERN_EDGE("cdr", 0)};
+static k_pattern_edge core_edges_2[] = {K_PATTERN_EDGE("any", 3), K_PATTERN_EDGE("closed-product", 4), K_PATTERN_EDGE("closed-union", 4), K_PATTERN_EDGE("open-product", 4), K_PATTERN_EDGE("open-union", 4)};
+static k_pattern_edge core_edges_4[] = {K_PATTERN_EDGE("cons", 5), K_PATTERN_EDGE("nil", 3)};
+static k_pattern_edge core_edges_5[] = {K_PATTERN_EDGE("car", 6), K_PATTERN_EDGE("cdr", 4)};
+static k_pattern_edge core_edges_6[] = {K_PATTERN_EDGE("label", 7), K_PATTERN_EDGE("target", 25)};
+static k_pattern_edge core_edges_7[] = {K_PATTERN_EDGE("cons", 8), K_PATTERN_EDGE("nil", 3)};
+static k_pattern_edge core_edges_8[] = {K_PATTERN_EDGE("car", 9), K_PATTERN_EDGE("cdr", 7)};
+static k_pattern_edge core_edges_9[] = {K_PATTERN_EDGE("ascii", 10), K_PATTERN_EDGE("bmp_common", 12), K_PATTERN_EDGE("bmp_private_use", 17), K_PATTERN_EDGE("plane0", 20), K_PATTERN_EDGE("supplementary_plane1", 21), K_PATTERN_EDGE("supplementary_planes2_16", 22)};
+static k_pattern_edge core_edges_10[] = {K_PATTERN_EDGE("0", 11), K_PATTERN_EDGE("1", 11), K_PATTERN_EDGE("2", 11), K_PATTERN_EDGE("3", 11), K_PATTERN_EDGE("4", 11), K_PATTERN_EDGE("5", 11), K_PATTERN_EDGE("6", 11)};
+static k_pattern_edge core_edges_11[] = {K_PATTERN_EDGE("0", 3), K_PATTERN_EDGE("1", 3)};
+static k_pattern_edge core_edges_12[] = {K_PATTERN_EDGE("hi", 13), K_PATTERN_EDGE("lo", 16)};
+static k_pattern_edge core_edges_13[] = {K_PATTERN_EDGE("h08_0F", 14), K_PATTERN_EDGE("h10_7F", 10), K_PATTERN_EDGE("h80_CF", 10), K_PATTERN_EDGE("hD0_D7", 14), K_PATTERN_EDGE("hF9", 3), K_PATTERN_EDGE("hFA_FB", 15), K_PATTERN_EDGE("hFC_FD", 15), K_PATTERN_EDGE("hFE_FF", 15)};
+static k_pattern_edge core_edges_14[] = {K_PATTERN_EDGE("0", 11), K_PATTERN_EDGE("1", 11), K_PATTERN_EDGE("2", 11)};
+static k_pattern_edge core_edges_15[] = {K_PATTERN_EDGE("0", 11)};
+static k_pattern_edge core_edges_16[] = {K_PATTERN_EDGE("0", 11), K_PATTERN_EDGE("1", 11), K_PATTERN_EDGE("2", 11), K_PATTERN_EDGE("3", 11), K_PATTERN_EDGE("4", 11), K_PATTERN_EDGE("5", 11), K_PATTERN_EDGE("6", 11), K_PATTERN_EDGE("7", 11)};
+static k_pattern_edge core_edges_17[] = {K_PATTERN_EDGE("hi", 18), K_PATTERN_EDGE("lo", 16)};
+static k_pattern_edge core_edges_18[] = {K_PATTERN_EDGE("hE0_EF", 19), K_PATTERN_EDGE("hF0_F7", 14), K_PATTERN_EDGE("hF8", 3)};
+static k_pattern_edge core_edges_19[] = {K_PATTERN_EDGE("0", 11), K_PATTERN_EDGE("1", 11), K_PATTERN_EDGE("2", 11), K_PATTERN_EDGE("3", 11)};
+static k_pattern_edge core_edges_20[] = {K_PATTERN_EDGE("0", 11), K_PATTERN_EDGE("1", 11), K_PATTERN_EDGE("10", 11), K_PATTERN_EDGE("2", 11), K_PATTERN_EDGE("3", 11), K_PATTERN_EDGE("4", 11), K_PATTERN_EDGE("5", 11), K_PATTERN_EDGE("6", 11), K_PATTERN_EDGE("7", 11), K_PATTERN_EDGE("8", 11), K_PATTERN_EDGE("9", 11)};
+static k_pattern_edge core_edges_21[] = {K_PATTERN_EDGE("lo", 16), K_PATTERN_EDGE("mid", 16)};
+static k_pattern_edge core_edges_22[] = {K_PATTERN_EDGE("lo", 16), K_PATTERN_EDGE("mid", 16), K_PATTERN_EDGE("plane", 23)};
+static k_pattern_edge core_edges_23[] = {K_PATTERN_EDGE("p02_03", 15), K_PATTERN_EDGE("p04_07", 24), K_PATTERN_EDGE("p08_0F", 14), K_PATTERN_EDGE("p10", 3)};
+static k_pattern_edge core_edges_24[] = {K_PATTERN_EDGE("0", 11), K_PATTERN_EDGE("1", 11)};
+static k_pattern_edge core_edges_25[] = {K_PATTERN_EDGE("0", 25), K_PATTERN_EDGE("1", 25), K_PATTERN_EDGE("_", 3)};
 
 static k_pattern_node core_nodes[] = {
   {KP_CLOSED_UNION, 2, core_edges_0},
@@ -433,7 +602,7 @@ static k_value *decode_node(bit_reader *reader, k_pattern *pattern, size_t node_
     for (size_t i = 0; i < node->edge_count; i++) {
       k_value *child = decode_node(reader, pattern, node->edges[i].target, rt);
       if (!reader->ok) return NULL;
-      k_product_set(product, node->edges[i].label, child);
+      k_product_set_n(product, node->edges[i].label, node->edges[i].label_length, child);
     }
     return product;
   }
@@ -450,7 +619,7 @@ static k_value *decode_node(bit_reader *reader, k_pattern *pattern, size_t node_
     k_pattern_edge *edge = &node->edges[ordinal];
     k_value *payload = decode_node(reader, pattern, edge->target, rt);
     if (!reader->ok) return NULL;
-    return k_variant(rt, edge->label, payload);
+    return k_variant_n(rt, edge->label, edge->label_length, payload);
   }
   reader->ok = 0;
   return NULL;
@@ -487,11 +656,177 @@ static unsigned bits_product_to_integer(k_value *value, int max_bit) {
   return result;
 }
 
-static char *string_value_to_ascii(k_value *value) {
+static k_value *unit_value(k_rt *rt);
+
+static k_value *bits_product(k_rt *rt, int max_bit, unsigned value) {
+  k_value *bits = k_product(rt, (size_t)max_bit + 1);
+  char label[16];
+  for (int bit = 0; bit <= max_bit; bit++) {
+    snprintf(label, sizeof(label), "%d", bit);
+    k_product_set(bits, label, k_variant(rt, ((value >> bit) & 1U) ? "1" : "0", unit_value(rt)));
+  }
+  return bits;
+}
+
+static int decode_bmp_common_hi(k_value *value, unsigned *out) {
+  const char *tag = k_variant_tag(value);
+  if (tag == NULL) return 0;
+  if (strcmp(tag, "h08_0F") == 0) {
+    *out = 0x08U + bits_product_to_integer(k_variant_payload(value), 2);
+    return 1;
+  }
+  if (strcmp(tag, "h10_7F") == 0) {
+    *out = 0x10U + bits_product_to_integer(k_variant_payload(value), 6);
+    return 1;
+  }
+  if (strcmp(tag, "h80_CF") == 0) {
+    *out = 0x80U + bits_product_to_integer(k_variant_payload(value), 6);
+    return 1;
+  }
+  if (strcmp(tag, "hD0_D7") == 0) {
+    *out = 0xd0U + bits_product_to_integer(k_variant_payload(value), 2);
+    return 1;
+  }
+  if (strcmp(tag, "hF9") == 0) {
+    *out = 0xf9U;
+    return 1;
+  }
+  if (strcmp(tag, "hFA_FB") == 0) {
+    *out = 0xfaU + bits_product_to_integer(k_variant_payload(value), 0);
+    return 1;
+  }
+  if (strcmp(tag, "hFC_FD") == 0) {
+    *out = 0xfcU + bits_product_to_integer(k_variant_payload(value), 0);
+    return 1;
+  }
+  if (strcmp(tag, "hFE_FF") == 0) {
+    *out = 0xfeU + bits_product_to_integer(k_variant_payload(value), 0);
+    return 1;
+  }
+  return 0;
+}
+
+static int decode_bmp_private_hi(k_value *value, unsigned *out) {
+  const char *tag = k_variant_tag(value);
+  if (tag == NULL) return 0;
+  if (strcmp(tag, "hE0_EF") == 0) {
+    *out = 0xe0U + bits_product_to_integer(k_variant_payload(value), 3);
+    return 1;
+  }
+  if (strcmp(tag, "hF0_F7") == 0) {
+    *out = 0xf0U + bits_product_to_integer(k_variant_payload(value), 2);
+    return 1;
+  }
+  if (strcmp(tag, "hF8") == 0) {
+    *out = 0xf8U;
+    return 1;
+  }
+  return 0;
+}
+
+static int decode_plane_2_to_16(k_value *value, unsigned *out) {
+  const char *tag = k_variant_tag(value);
+  if (tag == NULL) return 0;
+  if (strcmp(tag, "p02_03") == 0) {
+    *out = 2U + bits_product_to_integer(k_variant_payload(value), 0);
+    return 1;
+  }
+  if (strcmp(tag, "p04_07") == 0) {
+    *out = 4U + bits_product_to_integer(k_variant_payload(value), 1);
+    return 1;
+  }
+  if (strcmp(tag, "p08_0F") == 0) {
+    *out = 8U + bits_product_to_integer(k_variant_payload(value), 2);
+    return 1;
+  }
+  if (strcmp(tag, "p10") == 0) {
+    *out = 16U;
+    return 1;
+  }
+  return 0;
+}
+
+static int unicode_value_to_codepoint(k_value *value, unsigned *out) {
+  const char *tag = k_variant_tag(value);
+  if (tag == NULL) return 0;
+  k_value *payload = k_variant_payload(value);
+  if (strcmp(tag, "ascii") == 0) {
+    *out = bits_product_to_integer(payload, 6);
+    return 1;
+  }
+  if (strcmp(tag, "plane0") == 0) {
+    *out = bits_product_to_integer(payload, 10);
+    return 1;
+  }
+  if (strcmp(tag, "bmp_common") == 0) {
+    unsigned hi = 0;
+    k_value *product = payload;
+    if (!decode_bmp_common_hi(k_product_get(product, "hi"), &hi)) return 0;
+    *out = (hi << 8) | bits_product_to_integer(k_product_get(product, "lo"), 7);
+    return 1;
+  }
+  if (strcmp(tag, "bmp_private_use") == 0) {
+    unsigned hi = 0;
+    k_value *product = payload;
+    if (!decode_bmp_private_hi(k_product_get(product, "hi"), &hi)) return 0;
+    *out = (hi << 8) | bits_product_to_integer(k_product_get(product, "lo"), 7);
+    return 1;
+  }
+  if (strcmp(tag, "supplementary_plane1") == 0) {
+    k_value *product = payload;
+    *out = 0x10000U |
+      (bits_product_to_integer(k_product_get(product, "mid"), 7) << 8) |
+      bits_product_to_integer(k_product_get(product, "lo"), 7);
+    return 1;
+  }
+  if (strcmp(tag, "supplementary_planes2_16") == 0) {
+    unsigned plane = 0;
+    k_value *product = payload;
+    if (!decode_plane_2_to_16(k_product_get(product, "plane"), &plane)) return 0;
+    *out = (plane << 16) |
+      (bits_product_to_integer(k_product_get(product, "mid"), 7) << 8) |
+      bits_product_to_integer(k_product_get(product, "lo"), 7);
+    return 1;
+  }
+  return 0;
+}
+
+static int utf8_append(char **text, size_t *length, size_t *capacity, unsigned cp) {
+  if (cp > 0x10ffffU || (cp >= 0xd800U && cp <= 0xdfffU)) return 0;
+  size_t needed = cp <= 0x7fU ? 1 : cp <= 0x7ffU ? 2 : cp <= 0xffffU ? 3 : 4;
+  if (*length + needed + 1 > *capacity) {
+    while (*length + needed + 1 > *capacity) *capacity *= 2;
+    char *grown = realloc(*text, *capacity);
+    if (grown == NULL) abort();
+    *text = grown;
+  }
+  unsigned char *out = (unsigned char *)(*text + *length);
+  if (cp <= 0x7fU) {
+    out[0] = (unsigned char)cp;
+  } else if (cp <= 0x7ffU) {
+    out[0] = (unsigned char)(0xc0U | (cp >> 6));
+    out[1] = (unsigned char)(0x80U | (cp & 0x3fU));
+  } else if (cp <= 0xffffU) {
+    out[0] = (unsigned char)(0xe0U | (cp >> 12));
+    out[1] = (unsigned char)(0x80U | ((cp >> 6) & 0x3fU));
+    out[2] = (unsigned char)(0x80U | (cp & 0x3fU));
+  } else {
+    out[0] = (unsigned char)(0xf0U | (cp >> 18));
+    out[1] = (unsigned char)(0x80U | ((cp >> 12) & 0x3fU));
+    out[2] = (unsigned char)(0x80U | ((cp >> 6) & 0x3fU));
+    out[3] = (unsigned char)(0x80U | (cp & 0x3fU));
+  }
+  *length += needed;
+  (*text)[*length] = 0;
+  return 1;
+}
+
+static char *string_value_to_utf8(k_value *value, size_t *out_length) {
   size_t capacity = 16;
   size_t length = 0;
   char *text = malloc(capacity);
   if (text == NULL) abort();
+  text[0] = 0;
   k_value *cursor = value;
   for (;;) {
     const char *tag = k_variant_tag(cursor);
@@ -501,6 +836,7 @@ static char *string_value_to_ascii(k_value *value) {
     }
     if (strcmp(tag, "nil") == 0) {
       text[length] = 0;
+      *out_length = length;
       return text;
     }
     if (strcmp(tag, "cons") != 0) {
@@ -509,22 +845,11 @@ static char *string_value_to_ascii(k_value *value) {
     }
     k_value *pair = k_variant_payload(cursor);
     k_value *car = k_product_get(pair, "car");
-    if (!tag_is(car, "ascii")) {
+    unsigned cp = 0;
+    if (!unicode_value_to_codepoint(car, &cp) || !utf8_append(&text, &length, &capacity, cp)) {
       free(text);
       return NULL;
     }
-    unsigned cp = bits_product_to_integer(k_variant_payload(car), 6);
-    if (cp > 0x7f) {
-      free(text);
-      return NULL;
-    }
-    if (length + 2 > capacity) {
-      capacity *= 2;
-      char *grown = realloc(text, capacity);
-      if (grown == NULL) abort();
-      text = grown;
-    }
-    text[length++] = (char)cp;
     cursor = k_product_get(pair, "cdr");
   }
 }
@@ -585,9 +910,11 @@ static k_pattern *pattern_from_k_value(k_value *value) {
       k_value *edge_cursor = edges_list;
       for (size_t edge_index = 0; edge_index < edge_count; edge_index++) {
         k_value *edge = list_head(edge_cursor);
-        char *label = string_value_to_ascii(k_product_get(edge, "label"));
+        size_t label_length = 0;
+        char *label = string_value_to_utf8(k_product_get(edge, "label"), &label_length);
         if (label == NULL) return NULL;
         pattern->nodes[node_index].edges[edge_index].label = label;
+        pattern->nodes[node_index].edges[edge_index].label_length = label_length;
         pattern->nodes[node_index].edges[edge_index].target = bits_to_integer(k_product_get(edge, "target"));
         edge_cursor = list_tail(edge_cursor);
       }
@@ -609,7 +936,7 @@ static void free_pattern(k_pattern *pattern) {
   free(pattern);
 }
 
-k_value *k_read_wire(FILE *in, k_rt *rt) {
+static unsigned char *read_all(FILE *in, size_t *out_length) {
   size_t capacity = 4096;
   size_t length = 0;
   unsigned char *bytes = malloc(capacity);
@@ -629,6 +956,13 @@ k_value *k_read_wire(FILE *in, k_rt *rt) {
     free(bytes);
     return NULL;
   }
+  *out_length = length;
+  return bytes;
+}
+
+k_wire_input k_decode_wire_envelope(const unsigned char *bytes, size_t length, k_rt *rt) {
+  k_wire_input result = {NULL, NULL};
+  if (bytes == NULL) return result;
 
   bit_reader reader = {bytes, length, 0, 0, 1};
   k_rt *pattern_rt = k_rt_new();
@@ -636,10 +970,69 @@ k_value *k_read_wire(FILE *in, k_rt *rt) {
   k_pattern *pattern = reader.ok ? pattern_from_k_value(pattern_value) : NULL;
   k_value *value = pattern == NULL ? NULL : decode_node(&reader, pattern, 0, rt);
   int ok = reader.ok && br_zero_padding(&reader);
-  free_pattern(pattern);
   k_rt_free(pattern_rt);
+  if (!ok) {
+    free_pattern(pattern);
+    return result;
+  }
+  result.value = value;
+  result.pattern = pattern;
+  return result;
+}
+
+k_wire_input k_read_wire_envelope(FILE *in, k_rt *rt) {
+  k_wire_input result = {NULL, NULL};
+  size_t length = 0;
+  unsigned char *bytes = read_all(in, &length);
+  if (bytes == NULL) return result;
+  result = k_decode_wire_envelope(bytes, length, rt);
   free(bytes);
-  return ok ? value : NULL;
+  return result;
+}
+
+void k_wire_input_free(k_wire_input input) {
+  free_pattern(input.pattern);
+}
+
+k_value *k_read_wire(FILE *in, k_rt *rt) {
+  k_wire_input input = k_read_wire_envelope(in, rt);
+  k_value *value = input.value;
+  k_wire_input_free(input);
+  return value;
+}
+
+int k_pattern_equal(k_pattern *a, k_pattern *b) {
+  if (a == b) return 1;
+  if (a == NULL || b == NULL) return 0;
+  if (a->node_count != b->node_count) return 0;
+  for (size_t i = 0; i < a->node_count; i++) {
+    k_pattern_node *left = &a->nodes[i];
+    k_pattern_node *right = &b->nodes[i];
+    if (left->kind != right->kind || left->edge_count != right->edge_count) return 0;
+    for (size_t j = 0; j < left->edge_count; j++) {
+      if (left->edges[j].target != right->edges[j].target) return 0;
+      if (!bytes_equal(left->edges[j].label, left->edges[j].label_length, right->edges[j].label, right->edges[j].label_length)) return 0;
+    }
+  }
+  return 1;
+}
+
+static int wire_prefix_matches(const unsigned char *bytes, size_t length, const k_wire_prefix *prefix) {
+  if (bytes == NULL || prefix == NULL || !prefix->ok || length < prefix->length) return 0;
+  if (prefix->length > 0 && memcmp(bytes, prefix->bytes, prefix->length) != 0) return 0;
+  if (prefix->bit_count == 0) return 1;
+  if (length == prefix->length) return 0;
+  unsigned char mask = (unsigned char)(0xffU << (8 - prefix->bit_count));
+  unsigned char expected = (unsigned char)(prefix->current << (8 - prefix->bit_count));
+  return (bytes[prefix->length] & mask) == expected;
+}
+
+k_value *k_decode_wire_value_with_prefix(const unsigned char *bytes, size_t length, k_wire_prefix *prefix, k_pattern *pattern, k_rt *rt) {
+  if (!wire_prefix_matches(bytes, length, prefix)) return NULL;
+  bit_reader reader = {bytes, length, prefix->length, prefix->bit_count, 1};
+  k_value *value = decode_node(&reader, pattern, 0, rt);
+  if (!reader.ok || !br_zero_padding(&reader)) return NULL;
+  return value;
 }
 
 static void encode_node(bit_writer *writer, k_pattern *pattern, size_t node_id, k_value *value) {
@@ -658,19 +1051,20 @@ static void encode_node(bit_writer *writer, k_pattern *pattern, size_t node_id, 
       return;
     }
     for (size_t i = 0; i < node->edge_count; i++) {
-      encode_node(writer, pattern, node->edges[i].target, k_product_get(value, node->edges[i].label));
+      encode_node(writer, pattern, node->edges[i].target, k_product_get_n(value, node->edges[i].label, node->edges[i].label_length));
     }
     return;
   }
   if (node->kind == KP_OPEN_UNION || node->kind == KP_CLOSED_UNION) {
     const char *tag = k_variant_tag(value);
+    size_t tag_length = k_variant_tag_length(value);
     if (tag == NULL) {
       writer->ok = 0;
       return;
     }
     size_t ordinal = node->edge_count;
     for (size_t i = 0; i < node->edge_count; i++) {
-      if (strcmp(node->edges[i].label, tag) == 0) {
+      if (bytes_equal(node->edges[i].label, node->edges[i].label_length, tag, tag_length)) {
         ordinal = i;
         break;
       }
@@ -687,7 +1081,12 @@ static void encode_node(bit_writer *writer, k_pattern *pattern, size_t node_id, 
 static int compare_fields(const void *a, const void *b) {
   const k_field *fa = (const k_field *)a;
   const k_field *fb = (const k_field *)b;
-  return strcmp(fa->label, fb->label);
+  size_t min_length = fa->label_length < fb->label_length ? fa->label_length : fb->label_length;
+  int cmp = min_length == 0 ? 0 : memcmp(fa->label, fb->label, min_length);
+  if (cmp != 0) return cmp;
+  if (fa->label_length < fb->label_length) return -1;
+  if (fa->label_length > fb->label_length) return 1;
+  return 0;
 }
 
 static size_t derive_pattern_node(k_pattern *pattern, k_value *value) {
@@ -708,7 +1107,8 @@ static size_t derive_pattern_node(k_pattern *pattern, k_value *value) {
     pattern->nodes[node_id].edges = calloc(count, sizeof(k_pattern_edge));
     if (count > 0 && pattern->nodes[node_id].edges == NULL) abort();
     for (size_t i = 0; i < count; i++) {
-      pattern->nodes[node_id].edges[i].label = k_strdup(fields[i].label);
+      pattern->nodes[node_id].edges[i].label = heap_memdup_text(fields[i].label, fields[i].label_length);
+      pattern->nodes[node_id].edges[i].label_length = fields[i].label_length;
       pattern->nodes[node_id].edges[i].target = derive_pattern_node(pattern, fields[i].value);
     }
     free(fields);
@@ -718,7 +1118,8 @@ static size_t derive_pattern_node(k_pattern *pattern, k_value *value) {
   pattern->nodes[node_id].edge_count = 1;
   pattern->nodes[node_id].edges = calloc(1, sizeof(k_pattern_edge));
   if (pattern->nodes[node_id].edges == NULL) abort();
-  pattern->nodes[node_id].edges[0].label = k_strdup(value->as.variant.tag);
+  pattern->nodes[node_id].edges[0].label = heap_memdup_text(value->as.variant.tag, value->as.variant.tag_length);
+  pattern->nodes[node_id].edges[0].label_length = value->as.variant.tag_length;
   pattern->nodes[node_id].edges[0].target = derive_pattern_node(pattern, value->as.variant.payload);
   return node_id;
 }
@@ -736,35 +1137,162 @@ static k_value *unit_value(k_rt *rt) {
 
 static k_value *integer_to_bits(k_rt *rt, unsigned value) {
   k_value *result = k_variant(rt, "_", unit_value(rt));
+  if (value == 0) return result;
+
+  unsigned bits[sizeof(unsigned) * 8];
+  size_t count = 0;
   while (value > 0) {
-    result = k_variant(rt, (value & 1) ? "1" : "0", result);
+    bits[count++] = value & 1U;
     value >>= 1;
+  }
+  while (count > 0) {
+    unsigned bit = bits[--count];
+    result = k_variant(rt, bit ? "1" : "0", result);
   }
   return result;
 }
 
-static k_value *ascii_string_value(k_rt *rt, const char *text) {
+static k_value *encode_bmp_common_hi(k_rt *rt, unsigned hi) {
+  if (hi >= 0x08U && hi <= 0x0fU) return k_variant(rt, "h08_0F", bits_product(rt, 2, hi - 0x08U));
+  if (hi >= 0x10U && hi <= 0x7fU) return k_variant(rt, "h10_7F", bits_product(rt, 6, hi - 0x10U));
+  if (hi >= 0x80U && hi <= 0xcfU) return k_variant(rt, "h80_CF", bits_product(rt, 6, hi - 0x80U));
+  if (hi >= 0xd0U && hi <= 0xd7U) return k_variant(rt, "hD0_D7", bits_product(rt, 2, hi - 0xd0U));
+  if (hi == 0xf9U) return k_variant(rt, "hF9", unit_value(rt));
+  if (hi >= 0xfaU && hi <= 0xfbU) return k_variant(rt, "hFA_FB", bits_product(rt, 0, hi - 0xfaU));
+  if (hi >= 0xfcU && hi <= 0xfdU) return k_variant(rt, "hFC_FD", bits_product(rt, 0, hi - 0xfcU));
+  if (hi >= 0xfeU && hi <= 0xffU) return k_variant(rt, "hFE_FF", bits_product(rt, 0, hi - 0xfeU));
+  return NULL;
+}
+
+static k_value *encode_bmp_private_hi(k_rt *rt, unsigned hi) {
+  if (hi >= 0xe0U && hi <= 0xefU) return k_variant(rt, "hE0_EF", bits_product(rt, 3, hi - 0xe0U));
+  if (hi >= 0xf0U && hi <= 0xf7U) return k_variant(rt, "hF0_F7", bits_product(rt, 2, hi - 0xf0U));
+  if (hi == 0xf8U) return k_variant(rt, "hF8", unit_value(rt));
+  return NULL;
+}
+
+static k_value *encode_plane_2_to_16(k_rt *rt, unsigned plane) {
+  if (plane >= 2U && plane <= 3U) return k_variant(rt, "p02_03", bits_product(rt, 0, plane - 2U));
+  if (plane >= 4U && plane <= 7U) return k_variant(rt, "p04_07", bits_product(rt, 1, plane - 4U));
+  if (plane >= 8U && plane <= 15U) return k_variant(rt, "p08_0F", bits_product(rt, 2, plane - 8U));
+  if (plane == 16U) return k_variant(rt, "p10", unit_value(rt));
+  return NULL;
+}
+
+static k_value *codepoint_to_unicode_value(k_rt *rt, unsigned cp) {
+  if (cp > 0x10ffffU || (cp >= 0xd800U && cp <= 0xdfffU)) return NULL;
+  if (cp <= 0x7fU) return k_variant(rt, "ascii", bits_product(rt, 6, cp));
+  if (cp <= 0x7ffU) return k_variant(rt, "plane0", bits_product(rt, 10, cp));
+  if (cp <= 0xffffU) {
+    unsigned hi = (cp >> 8) & 0xffU;
+    unsigned lo = cp & 0xffU;
+    k_value *product = k_product(rt, 2);
+    if (hi >= 0xe0U && hi <= 0xf8U) {
+      k_product_set(product, "hi", encode_bmp_private_hi(rt, hi));
+      k_product_set(product, "lo", bits_product(rt, 7, lo));
+      return k_variant(rt, "bmp_private_use", product);
+    }
+    k_product_set(product, "hi", encode_bmp_common_hi(rt, hi));
+    k_product_set(product, "lo", bits_product(rt, 7, lo));
+    return k_variant(rt, "bmp_common", product);
+  }
+
+  unsigned mid = (cp >> 8) & 0xffU;
+  unsigned lo = cp & 0xffU;
+  k_value *product = k_product(rt, cp <= 0x1ffffU ? 2 : 3);
+  if (cp <= 0x1ffffU) {
+    k_product_set(product, "mid", bits_product(rt, 7, mid));
+    k_product_set(product, "lo", bits_product(rt, 7, lo));
+    return k_variant(rt, "supplementary_plane1", product);
+  }
+  k_product_set(product, "plane", encode_plane_2_to_16(rt, cp >> 16));
+  k_product_set(product, "mid", bits_product(rt, 7, mid));
+  k_product_set(product, "lo", bits_product(rt, 7, lo));
+  return k_variant(rt, "supplementary_planes2_16", product);
+}
+
+static int utf8_next_codepoint(const unsigned char **cursor, const unsigned char *end, unsigned *out) {
+  const unsigned char *p = *cursor;
+  if (p >= end) return 0;
+  if (*p <= 0x7fU) {
+    *out = *p;
+    *cursor = p + 1;
+    return 1;
+  }
+  if ((*p & 0xe0U) == 0xc0U) {
+    if (p + 2 > end) return 0;
+    if ((p[1] & 0xc0U) != 0x80U) return 0;
+    unsigned cp = ((unsigned)(p[0] & 0x1fU) << 6) | (unsigned)(p[1] & 0x3fU);
+    if (cp < 0x80U) return 0;
+    *out = cp;
+    *cursor = p + 2;
+    return 1;
+  }
+  if ((*p & 0xf0U) == 0xe0U) {
+    if (p + 3 > end) return 0;
+    if ((p[1] & 0xc0U) != 0x80U || (p[2] & 0xc0U) != 0x80U) return 0;
+    unsigned cp = ((unsigned)(p[0] & 0x0fU) << 12) |
+      ((unsigned)(p[1] & 0x3fU) << 6) |
+      (unsigned)(p[2] & 0x3fU);
+    if (cp < 0x800U || (cp >= 0xd800U && cp <= 0xdfffU)) return 0;
+    *out = cp;
+    *cursor = p + 3;
+    return 1;
+  }
+  if ((*p & 0xf8U) == 0xf0U) {
+    if (p + 4 > end) return 0;
+    if ((p[1] & 0xc0U) != 0x80U || (p[2] & 0xc0U) != 0x80U || (p[3] & 0xc0U) != 0x80U) return 0;
+    unsigned cp = ((unsigned)(p[0] & 0x07U) << 18) |
+      ((unsigned)(p[1] & 0x3fU) << 12) |
+      ((unsigned)(p[2] & 0x3fU) << 6) |
+      (unsigned)(p[3] & 0x3fU);
+    if (cp < 0x10000U || cp > 0x10ffffU) return 0;
+    *out = cp;
+    *cursor = p + 4;
+    return 1;
+  }
+  return 0;
+}
+
+static k_value *utf8_string_value_n(k_rt *rt, const char *text, size_t text_length) {
   k_value *result = k_variant(rt, "nil", unit_value(rt));
-  size_t length = strlen(text);
-  for (size_t i = length; i > 0; i--) {
-    unsigned char ch = (unsigned char)text[i - 1];
-    k_value *bits = k_product(rt, 7);
-    char label[2] = {0, 0};
-    for (int bit = 0; bit <= 6; bit++) {
-      label[0] = (char)('0' + bit);
-      k_product_set(bits, label, k_variant(rt, ((ch >> bit) & 1) ? "1" : "0", unit_value(rt)));
+  const unsigned char *cursor = (const unsigned char *)text;
+  const unsigned char *end = cursor + text_length;
+  unsigned *codepoints = NULL;
+  size_t count = 0;
+  while (cursor < end) {
+    unsigned cp = 0;
+    if (!utf8_next_codepoint(&cursor, end, &cp)) {
+      free(codepoints);
+      return NULL;
+    }
+    unsigned *grown = realloc(codepoints, (count + 1) * sizeof(unsigned));
+    if (grown == NULL) abort();
+    codepoints = grown;
+    codepoints[count++] = cp;
+  }
+  for (size_t i = count; i > 0; i--) {
+    k_value *unicode = codepoint_to_unicode_value(rt, codepoints[i - 1]);
+    if (unicode == NULL) {
+      free(codepoints);
+      return NULL;
     }
     k_value *pair = k_product(rt, 2);
-    k_product_set(pair, "car", k_variant(rt, "ascii", bits));
+    k_product_set(pair, "car", unicode);
     k_product_set(pair, "cdr", result);
     result = k_variant(rt, "cons", pair);
   }
+  free(codepoints);
   return result;
+}
+
+static k_value *utf8_string_value(k_rt *rt, const char *text) {
+  return utf8_string_value_n(rt, text, strlen(text));
 }
 
 static k_value *edge_to_k(k_rt *rt, k_pattern_edge *edge) {
   k_value *product = k_product(rt, 2);
-  k_product_set(product, "label", ascii_string_value(rt, edge->label));
+  k_product_set(product, "label", utf8_string_value_n(rt, edge->label, edge->label_length));
   k_product_set(product, "target", integer_to_bits(rt, (unsigned)edge->target));
   return product;
 }
@@ -809,17 +1337,66 @@ static k_value *pattern_to_k_value(k_rt *rt, k_pattern *pattern) {
   return result;
 }
 
-int k_write_wire(FILE *out, k_value *value) {
-  k_pattern *pattern = derive_pattern(value);
+k_wire_prefix k_wire_prefix_for_pattern(k_pattern *pattern) {
+  k_wire_prefix prefix = {NULL, 0, 0, 0, 0};
   k_rt *pattern_rt = k_rt_new();
   k_value *pattern_value = pattern_to_k_value(pattern_rt, pattern);
   bit_writer writer = {NULL, 0, 0, 0, 0, 1};
   encode_node(&writer, &core_pattern, 0, pattern_value);
+  k_rt_free(pattern_rt);
+  if (!writer.ok) {
+    free(writer.bytes);
+    return prefix;
+  }
+  prefix.bytes = writer.bytes;
+  prefix.length = writer.length;
+  prefix.current = writer.current;
+  prefix.bit_count = writer.bit_count;
+  prefix.ok = 1;
+  return prefix;
+}
+
+void k_wire_prefix_free(k_wire_prefix prefix) {
+  free(prefix.bytes);
+}
+
+unsigned char *k_encode_wire_as_with_prefix(k_wire_prefix *prefix, k_pattern *pattern, k_value *value, size_t *out_length) {
+  if (out_length != NULL) *out_length = 0;
+  if (prefix == NULL || !prefix->ok) return NULL;
+  size_t capacity = prefix->length + 64;
+  if (capacity < prefix->length) return NULL;
+  unsigned char *bytes = malloc(capacity == 0 ? 1 : capacity);
+  if (bytes == NULL) abort();
+  if (prefix->length > 0) memcpy(bytes, prefix->bytes, prefix->length);
+  bit_writer writer = {bytes, prefix->length, capacity, prefix->current, prefix->bit_count, 1};
   encode_node(&writer, pattern, 0, value);
   bw_flush(&writer);
-  int ok = writer.ok && fwrite(writer.bytes, 1, writer.length, out) == writer.length;
-  free(writer.bytes);
-  k_rt_free(pattern_rt);
+  if (!writer.ok) {
+    free(writer.bytes);
+    return NULL;
+  }
+  if (out_length != NULL) *out_length = writer.length;
+  return writer.bytes;
+}
+
+unsigned char *k_encode_wire_as(k_pattern *pattern, k_value *value, size_t *out_length) {
+  k_wire_prefix prefix = k_wire_prefix_for_pattern(pattern);
+  unsigned char *bytes = k_encode_wire_as_with_prefix(&prefix, pattern, value, out_length);
+  k_wire_prefix_free(prefix);
+  return bytes;
+}
+
+int k_write_wire_as(FILE *out, k_pattern *pattern, k_value *value) {
+  size_t length = 0;
+  unsigned char *bytes = k_encode_wire_as(pattern, value, &length);
+  int ok = bytes != NULL && fwrite(bytes, 1, length, out) == length;
+  free(bytes);
+  return ok;
+}
+
+int k_write_wire(FILE *out, k_value *value) {
+  k_pattern *pattern = derive_pattern(value);
+  int ok = k_write_wire_as(out, pattern, value);
   free_pattern(pattern);
   return ok;
 }

@@ -43,7 +43,7 @@ clang -Wno-override-module -Iruntime runtime/krt.c tests/variant-driver.c "$TMP_
 node ../k.kir/objects/compile.mjs '/tag' "$TMP_DIR/variant-projection.ko"
 printf '[["closed-union",[["tag",1]]],["closed-product",[]]]' > "$TMP_DIR/variant-projection.pattern.json"
 node ./bin/k-llvm-compile.mjs --input-pattern "$TMP_DIR/variant-projection.pattern.json" "$TMP_DIR/variant-projection.ko" "$TMP_DIR/variant-projection.ll"
-grep -q 'call ptr @k_variant_tag' "$TMP_DIR/variant-projection.ll"
+grep -q 'call i32 @k_variant_tag_matches' "$TMP_DIR/variant-projection.ll"
 grep -q 'call ptr @k_variant_payload' "$TMP_DIR/variant-projection.ll"
 clang -Wno-override-module -Iruntime runtime/krt.c tests/variant-projection-driver.c "$TMP_DIR/variant-projection.ll" -o "$TMP_DIR/variant-projection"
 "$TMP_DIR/variant-projection"
@@ -51,8 +51,8 @@ clang -Wno-override-module -Iruntime runtime/krt.c tests/variant-projection-driv
 node ../k.kir/objects/compile.mjs '(.x .y)' "$TMP_DIR/composition.ko"
 printf '[["closed-product",[["x",1]]],["closed-product",[["y",2]]],["closed-product",[]]]' > "$TMP_DIR/composition.pattern.json"
 node ./bin/k-llvm-compile.mjs --input-pattern "$TMP_DIR/composition.pattern.json" "$TMP_DIR/composition.ko" "$TMP_DIR/composition.ll"
-grep -q 'call ptr @k_product_get(ptr %input' "$TMP_DIR/composition.ll"
-grep -q 'call ptr @k_product_get(ptr %field' "$TMP_DIR/composition.ll"
+grep -q 'call ptr @k_product_get_n(ptr %input' "$TMP_DIR/composition.ll"
+grep -q 'call ptr @k_product_get_n(ptr %field' "$TMP_DIR/composition.ll"
 clang -Wno-override-module -Iruntime runtime/krt.c tests/composition-driver.c "$TMP_DIR/composition.ll" -o "$TMP_DIR/composition"
 "$TMP_DIR/composition"
 
@@ -76,6 +76,8 @@ node ./bin/k-llvm-compile.mjs --help | grep -q 'Compile a k .ko/.klib object'
 
 node ./bin/k-llvm-build.mjs --help | grep -q 'binary k pattern+value envelope'
 
+node ./bin/k-llvm-jit.mjs --help | grep -q 'stdin binary envelope'
+
 node ./bin/k-llvm-run.mjs --help | grep -q 'Compile and execute a k .ko/.klib object'
 
 node ../k.kir/objects/compile.mjs '.x' "$TMP_DIR/run.ko"
@@ -88,9 +90,60 @@ node ../k.kir/objects/compile.mjs '{ .x fieldA, .y fieldB }' "$TMP_DIR/run-produ
 printf '{"x":"left","y":"right"}' > "$TMP_DIR/run-product-input.kv"
 node ./bin/k-llvm-run.mjs "$TMP_DIR/run-product.ko" "$TMP_DIR/run-product-input.kv" | grep -qx '{"fieldA":"left","fieldB":"right"}'
 
-node ./bin/k-llvm-build.mjs "$TMP_DIR/run.ko" "$TMP_DIR/run-exe"
+printf '[["closed-product",[["x",1],["y",3]]],["open-union",[["left",2]]],["closed-product",[]],["open-union",[["right",2]]]]' > "$TMP_DIR/run-envelope.pattern.json"
+node ./bin/k-llvm-build.mjs --input-pattern "$TMP_DIR/run-envelope.pattern.json" "$TMP_DIR/run.ko" "$TMP_DIR/run-exe"
 printf '{"x":"left","y":"right"}' \
   | node ../k.kir/codecs/k-parse.mjs \
   | "$TMP_DIR/run-exe" \
   | node ../k.kir/codecs/k-print.mjs \
   | grep -qx '"left"'
+
+printf '{"x":"left"}' | node ../k.kir/codecs/k-parse.mjs | "$TMP_DIR/run-exe" && exit 1 || test "$?" -eq 5
+
+printf '[["open-union",[["left",1],["right",1]]],["closed-product",[]]]' > "$TMP_DIR/identity-variant.pattern.json"
+node ./bin/k-llvm-build.mjs --input-pattern "$TMP_DIR/identity-variant.pattern.json" "$TMP_DIR/id.ko" "$TMP_DIR/id-exe"
+node --input-type=module -e "import { stdout } from 'node:process'; import { encodeToWire } from '../k.kir/codecs/runtime/prefix-codec.mjs'; import { Value } from '../k.kir/Value.mjs'; const pattern = [[\"open-union\",[[\"left\",1],[\"right\",1]]],[\"closed-product\",[]]]; stdout.write(encodeToWire(Value.variant(\"left\", Value.product({}), pattern), pattern));" \
+  | "$TMP_DIR/id-exe" \
+  | node --input-type=module -e "import { stdin } from 'node:process'; import { decodeWire } from '../k.kir/codecs/runtime/prefix-codec.mjs'; const chunks = []; stdin.on('data', (chunk) => chunks.push(chunk)); stdin.on('end', () => console.log(JSON.stringify(decodeWire(Buffer.concat(chunks)).pattern)));" \
+  | grep -Fqx '[["open-union",[["left",1],["right",1]]],["closed-product",[]]]'
+
+printf '[["closed-union",[["+",1],["-",1]]],["closed-union",[["0",1],["1",1],["_",2]]],["closed-product",[]]]' > "$TMP_DIR/identity-int.pattern.json"
+node ./bin/k-llvm-build.mjs --input-pattern "$TMP_DIR/identity-int.pattern.json" "$TMP_DIR/id.ko" "$TMP_DIR/id-int-exe"
+printf '2' \
+  | node ../k.kir/codecs/int.mjs --parse \
+  | "$TMP_DIR/id-int-exe" \
+  | node ../k.kir/codecs/int.mjs --print \
+  | grep -qx '2'
+
+node --input-type=module -e "import assert from 'node:assert/strict'; import { spawn } from 'node:child_process'; import { encodeToWire, decodeWire } from '../k.kir/codecs/runtime/prefix-codec.mjs'; import { parse, INT_PATTERN } from '../k.kir/codecs/int.mjs'; const input = encodeToWire(parse('2'), INT_PATTERN); const header = Buffer.alloc(4); header.writeUInt32BE(input.length); const child = spawn(process.argv[1], ['--server']); const chunks = []; const stderr = []; child.stdout.on('data', (chunk) => chunks.push(chunk)); child.stderr.on('data', (chunk) => stderr.push(chunk)); child.stdin.end(Buffer.concat([header, input])); const status = await new Promise((resolve, reject) => { child.on('error', reject); child.on('close', resolve); }); assert.equal(status, 0, Buffer.concat(stderr).toString('utf8')); const output = Buffer.concat(chunks); const length = output.readUInt32BE(0); assert.equal(output.length, 4 + length); assert.deepEqual(decodeWire(output.subarray(4)).value.toJSON(), parse('2').toJSON());" "$TMP_DIR/id-int-exe"
+
+printf '{"x":"left","y":"right"}' \
+  | node ../k.kir/codecs/k-parse.mjs \
+  | node ./bin/k-llvm-jit.mjs --cache-dir "$TMP_DIR/jit-cache" "$TMP_DIR/run.ko" \
+  | node ../k.kir/codecs/k-print.mjs \
+  | grep -qx '"left"'
+
+node --input-type=module -e "import { stdout } from 'node:process'; import { encodeToWire } from '../k.kir/codecs/runtime/prefix-codec.mjs'; import { Value } from '../k.kir/Value.mjs'; const pattern = [[\"open-union\",[[\"left\",1],[\"right\",1]]],[\"closed-product\",[]]]; stdout.write(encodeToWire(Value.variant(\"left\", Value.product({}), pattern), pattern));" \
+  | node ./bin/k-llvm-jit.mjs --cache-dir "$TMP_DIR/jit-cache" "$TMP_DIR/id.ko" \
+  | node --input-type=module -e "import { stdin } from 'node:process'; import { decodeWire } from '../k.kir/codecs/runtime/prefix-codec.mjs'; const chunks = []; stdin.on('data', (chunk) => chunks.push(chunk)); stdin.on('end', () => console.log(JSON.stringify(decodeWire(Buffer.concat(chunks)).pattern)));" \
+  | grep -Fqx '[["open-union",[["left",1],["right",1]]],["closed-product",[]]]'
+
+node ../k.kir/objects/compile.mjs '/"ह" |"😀"' "$TMP_DIR/unicode-variant.ko"
+node --input-type=module -e "import { stdout } from 'node:process'; import { encodeToWire } from '../k.kir/codecs/runtime/prefix-codec.mjs'; import { Value } from '../k.kir/Value.mjs'; const pattern = [[\"closed-union\", [[\"ह\", 1]]], [\"closed-product\", []]]; stdout.write(encodeToWire(Value.variant('ह', Value.product({}), pattern), pattern));" \
+  | node ./bin/k-llvm-jit.mjs --cache-dir "$TMP_DIR/jit-cache" "$TMP_DIR/unicode-variant.ko" \
+  | node ../k.kir/codecs/k-print.mjs \
+  | grep -qx '"😀"'
+
+node ../k.kir/objects/compile.mjs '/"a\u0000b" |"nul-ok"' "$TMP_DIR/nul-variant.ko"
+node --input-type=module -e "import { stdout } from 'node:process'; import { encodeToWire } from '../k.kir/codecs/runtime/prefix-codec.mjs'; import { Value } from '../k.kir/Value.mjs'; const tag = 'a\u0000b'; const pattern = [[\"closed-union\", [[tag, 1]]], [\"closed-product\", []]]; stdout.write(encodeToWire(Value.variant(tag, Value.product({}), pattern), pattern));" \
+  | node ./bin/k-llvm-jit.mjs --cache-dir "$TMP_DIR/jit-cache" "$TMP_DIR/nul-variant.ko" \
+  | node ../k.kir/codecs/k-print.mjs \
+  | grep -qx '"nul-ok"'
+
+node --input-type=module -e "import { stdout } from 'node:process'; import { encodeToWire } from '../k.kir/codecs/runtime/prefix-codec.mjs'; import { Value } from '../k.kir/Value.mjs'; const labels = ['a', 'é', 'ह', '\uE000', '😀', '𠀀', 'a\u0000b']; const pattern = [[\"closed-product\", labels.map((label) => [label, 1])], [\"closed-product\", []]]; const value = Value.product(Object.fromEntries(labels.map((label) => [label, Value.product({})])), pattern); stdout.write(encodeToWire(value, pattern));" \
+  | node ./bin/k-llvm-jit.mjs --cache-dir "$TMP_DIR/jit-cache" "$TMP_DIR/id.ko" \
+  | node --input-type=module -e "import assert from 'node:assert/strict'; import { stdin } from 'node:process'; import { decodeWire } from '../k.kir/codecs/runtime/prefix-codec.mjs'; const chunks = []; for await (const chunk of stdin) chunks.push(chunk); const labels = ['a', 'é', 'ह', '\uE000', '😀', '𠀀', 'a\u0000b']; const { pattern } = decodeWire(Buffer.concat(chunks)); assert.equal(pattern[0][0], 'closed-product'); assert.deepEqual(new Set(pattern[0][1].map(([label]) => label)), new Set(labels));"
+
+node --input-type=module -e "import { stdout } from 'node:process'; import { encodeToWire } from '../k.kir/codecs/runtime/prefix-codec.mjs'; import { Value } from '../k.kir/Value.mjs'; const labels = ['a', 'é', 'ह', '\uE000', '😀', '𠀀', 'a\u0000b']; const pattern = [[\"open-union\", labels.map((label) => [label, 1])], [\"closed-product\", []]]; stdout.write(encodeToWire(Value.variant('a\u0000b', Value.product({}), pattern), pattern));" \
+  | node ./bin/k-llvm-jit.mjs --cache-dir "$TMP_DIR/jit-cache" "$TMP_DIR/id.ko" \
+  | node --input-type=module -e "import assert from 'node:assert/strict'; import { stdin } from 'node:process'; import { decodeWire } from '../k.kir/codecs/runtime/prefix-codec.mjs'; const chunks = []; for await (const chunk of stdin) chunks.push(chunk); const labels = ['a', 'é', 'ह', '\uE000', '😀', '𠀀', 'a\u0000b']; const { pattern, value } = decodeWire(Buffer.concat(chunks)); assert.equal(pattern[0][0], 'open-union'); assert.deepEqual(new Set(pattern[0][1].map(([label]) => label)), new Set(labels)); assert.equal(value.tag, 'a\u0000b');"

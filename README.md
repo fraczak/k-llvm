@@ -43,13 +43,15 @@ status in `k_result`. These operations can compose through KIR `comp`.
 ```sh
 k-llvm-build [options] object.ko output-exe
 k-llvm-compile [options] object.ko [output.ll]
+k-llvm-jit [options] object.ko
 k-llvm-run [options] object.ko [input.kv]
 ```
 
 Options:
 
 - `--retype rel`: relation to specialize; defaults to the object's `main`.
-- `--input-pattern json-or-file`: KIR property-list input pattern.
+- `--input-pattern json-or-file`: KIR property-list input pattern; required
+  for `k-llvm-build`.
 - `--expect value-or-file`: for `k-llvm-run`, compare the output value against
   expected value text.
 - `-h`, `--help`: show usage.
@@ -59,18 +61,35 @@ Source compilation remains owned by core `k`.
 Without `--expect`, `k-llvm-run` prints the result value as compact JSON.
 `k-llvm-build` emits a native executable that reads and writes the binary
 k pattern+value envelope used by `codecs/k-parse.mjs` and `codecs/k-print.mjs`.
-The native envelope codec currently supports ASCII labels and tags.
+The executable checks the stdin envelope pattern against the compiled input
+pattern and encodes stdout with the compiled output pattern.
+`k-llvm-jit` reads the stdin binary envelope first, specializes the object with
+that input pattern, caches the native executable, and writes the compiled
+output envelope to stdout.
+The native envelope codec supports the k Unicode string encoding used for
+labels and tags.
 
 ## Tests
 
 ```sh
 npm test
 node ./scripts/conformance.mjs
+npm run perf:int
+npm run perf:ieee
 ```
 
 The conformance runner reuses supported fixtures from `../k.kir/conformance`,
 emits LLVM IR for each fixture, generates a small C driver for the fixture
 input and expected value, links it with `runtime/krt.c`, and runs the binary.
+
+The performance runners mirror the `k-wasm` integer and IEEE harnesses. They
+load the real example programs from `@fraczak/k`, generate the same operation
+matrices, compare backend output to native `k` results, and time the native JS,
+kVM, and LLVM executable lanes. Set `LLVM_ONLY=1` to skip native timing,
+`ITERATIONS=N` to change samples, and `LLVM_STRICT=1` to make unsupported LLVM
+cases fail the process. The LLVM lane uses persistent, pipelined executables by
+default; set `LLVM_SPAWN_PER_CALL=1` to reproduce the older
+spawn-per-operation timing.
 
 ## Scope
 

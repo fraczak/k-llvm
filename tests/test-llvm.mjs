@@ -13,7 +13,8 @@ assert.match(kirR.instanceKey, /^__main__@[0-9a-f]{16}$/);
 assert.match(llvm, /^; k-llvm prototype artifact/m);
 assert.match(llvm, /@k_llvm_metadata = private unnamed_addr constant/);
 assert.match(llvm, /%k_result = type \{ i32, ptr \}/);
-assert.match(llvm, /declare ptr @k_product_get\(ptr, ptr\)/);
+assert.match(llvm, /declare ptr @k_product_get_n\(ptr, ptr, i64\)/);
+assert.match(llvm, /declare void @k_product_set_borrowed_n\(ptr, ptr, i64, ptr\)/);
 assert.match(llvm, /define %k_result @k_main\(ptr %rt, ptr %input\)/);
 assert.match(llvm, /insertvalue %k_result undef, i32 0, 0/);
 assert.match(llvm, /insertvalue %k_result %status\d+, ptr %input, 1/);
@@ -56,7 +57,7 @@ const { llvm: projectionLLVM } = compileObjectToLLVM(projectionObject, {
   ]
 });
 assert.match(projectionLLVM, /@k_label_0 = private unnamed_addr constant \[2 x i8\] c"x\\00"/);
-assert.match(projectionLLVM, /call ptr @k_product_get\(ptr %input, ptr %label0\)/);
+assert.match(projectionLLVM, /call ptr @k_product_get_n\(ptr %input, ptr %label0, i64 1\)/);
 
 const productObject = decodeObject(compileObjectBuffer("{ .x fieldA, .y fieldB }", { source: "llvm-product.k" }));
 const { llvm: productLLVM } = compileObjectToLLVM(productObject, {
@@ -67,13 +68,13 @@ const { llvm: productLLVM } = compileObjectToLLVM(productObject, {
   ]
 });
 assert.match(productLLVM, /call ptr @k_product\(ptr %rt, i64 2\)/);
-assert.match(productLLVM, /call void @k_product_set\(ptr %product\d+, ptr %label\d+, ptr %field\d+\)/);
+assert.match(productLLVM, /call void @k_product_set_borrowed_n\(ptr %product\d+, ptr %label\d+, i64 \d+, ptr %field\d+\)/);
 
 const variantObject = decodeObject(compileObjectBuffer("|tag", { source: "llvm-variant.k" }));
 const { llvm: variantLLVM } = compileObjectToLLVM(variantObject, {
   inputPattern: [["closed-product", []]]
 });
-assert.match(variantLLVM, /call ptr @k_variant\(ptr %rt, ptr %label\d+, ptr %input\)/);
+assert.match(variantLLVM, /call ptr @k_variant_borrowed_n\(ptr %rt, ptr %label\d+, i64 3, ptr %input\)/);
 
 const variantProjectionObject = decodeObject(compileObjectBuffer("/tag", { source: "llvm-variant-projection.k" }));
 const { llvm: variantProjectionLLVM } = compileObjectToLLVM(variantProjectionObject, {
@@ -82,8 +83,7 @@ const { llvm: variantProjectionLLVM } = compileObjectToLLVM(variantProjectionObj
     ["closed-product", []]
   ]
 });
-assert.match(variantProjectionLLVM, /call ptr @k_variant_tag\(ptr %input\)/);
-assert.match(variantProjectionLLVM, /call i32 @strcmp\(ptr %tag\d+, ptr %label\d+\)/);
+assert.match(variantProjectionLLVM, /call i32 @k_variant_tag_matches\(ptr %input, ptr %label\d+, i64 3\)/);
 assert.match(variantProjectionLLVM, /call ptr @k_variant_payload\(ptr %input\)/);
 
 const compositionObject = decodeObject(compileObjectBuffer("(.x .y)", { source: "llvm-composition.k" }));
@@ -94,8 +94,8 @@ const { llvm: compositionLLVM } = compileObjectToLLVM(compositionObject, {
     ["closed-product", []]
   ]
 });
-assert.match(compositionLLVM, /call ptr @k_product_get\(ptr %input, ptr %label\d+\)/);
-assert.match(compositionLLVM, /call ptr @k_product_get\(ptr %field\d+, ptr %label\d+\)/);
+assert.match(compositionLLVM, /call ptr @k_product_get_n\(ptr %input, ptr %label\d+, i64 1\)/);
+assert.match(compositionLLVM, /call ptr @k_product_get_n\(ptr %field\d+, ptr %label\d+, i64 1\)/);
 
 const relationObject = decodeObject(compileObjectBuffer("pick = .x; {.a pick left, .b pick right}", { source: "llvm-relation.k" }));
 const { llvm: relationLLVM } = compileObjectToLLVM(relationObject, {
@@ -136,5 +136,18 @@ assert.match(unionLLVM, /define internal %k_result @k_union_arm_0\(ptr %rt, ptr 
 assert.match(unionLLVM, /define internal %k_result @k_union_arm_1\(ptr %rt, ptr %input\)/);
 assert.match(unionLLVM, /call %k_result @k_union_arm_0\(ptr %rt, ptr %input\)/);
 assert.match(unionLLVM, /call %k_result @k_union_arm_1\(ptr %rt, ptr %input\)/);
+
+const nestedUnionObject = decodeObject(compileObjectBuffer("{ < /x |left, /y |right > z }", { source: "llvm-nested-union.k" }));
+const { llvm: nestedUnionLLVM } = compileObjectToLLVM(nestedUnionObject, {
+  inputPattern: [
+    ["closed-union", [["x", 1], ["y", 2]]],
+    ["closed-product", []],
+    ["closed-product", []]
+  ]
+});
+assert.match(nestedUnionLLVM, /define internal %k_result @k_union_expr_\d+\(ptr %rt, ptr %input\)/);
+assert.match(nestedUnionLLVM, /call %k_result @k_union_expr_\d+\(ptr %rt, ptr %input\)/);
+assert.match(nestedUnionLLVM, /call void @k_product_set_borrowed_n\(ptr %product\d+, ptr %label\d+, i64 1, ptr %union_value\d+\)/);
+assert.doesNotMatch(nestedUnionLLVM, /ptr false/);
 
 console.log("OK");

@@ -33,6 +33,60 @@ function cString(text) {
   return JSON.stringify(String(text));
 }
 
+function cByteArray(text) {
+  const bytes = [...Buffer.from(String(text), "utf8")];
+  return bytes.length === 0 ? "{0}" : `{${bytes.map((byte) => `0x${byte.toString(16).padStart(2, "0")}`).join(", ")}}`;
+}
+
+const patternKindConstants = {
+  "any": "KP_ANY",
+  "open-product": "KP_OPEN_PRODUCT",
+  "open-union": "KP_OPEN_UNION",
+  "closed-product": "KP_CLOSED_PRODUCT",
+  "closed-union": "KP_CLOSED_UNION"
+};
+
+function emitPattern(name, pattern) {
+  if (!Array.isArray(pattern)) throw new Error(`${name} pattern must be a property-list array`);
+  const lines = [];
+  for (let nodeIndex = 0; nodeIndex < pattern.length; nodeIndex++) {
+    const node = pattern[nodeIndex];
+    if (!Array.isArray(node) || node.length !== 2) {
+      throw new Error(`${name} pattern node ${nodeIndex} is invalid`);
+    }
+    const [, edges] = node;
+    if (!Array.isArray(edges)) throw new Error(`${name} pattern node ${nodeIndex} edges are invalid`);
+    for (let edgeIndex = 0; edgeIndex < edges.length; edgeIndex++) {
+      const edge = edges[edgeIndex];
+      if (!Array.isArray(edge) || edge.length !== 2) {
+        throw new Error(`${name} pattern node ${nodeIndex} edge is invalid`);
+      }
+      const [label] = edge;
+      lines.push(`static const unsigned char ${name}_label_${nodeIndex}_${edgeIndex}[] = ${cByteArray(label)};`);
+    }
+    if (edges.length === 0) continue;
+    lines.push(`static k_pattern_edge ${name}_edges_${nodeIndex}[] = {`);
+    for (let edgeIndex = 0; edgeIndex < edges.length; edgeIndex++) {
+      const edge = edges[edgeIndex];
+      const [label, target] = edge;
+      const labelLength = Buffer.byteLength(String(label), "utf8");
+      const labelRef = `${name}_label_${nodeIndex}_${edgeIndex}`;
+      lines.push(`  {(const char *)${labelRef}, ${labelLength}, ${Number(target)}}${edgeIndex === edges.length - 1 ? "" : ","}`);
+    }
+    lines.push("};");
+  }
+  lines.push(`static k_pattern_node ${name}_nodes[] = {`);
+  pattern.forEach(([kind, edges], index) => {
+    const constant = patternKindConstants[kind];
+    if (constant == null) throw new Error(`${name} pattern node ${index} has unsupported kind '${kind}'`);
+    const edgeRef = edges.length === 0 ? "NULL" : `${name}_edges_${index}`;
+    lines.push(`  {${constant}, ${edges.length}, ${edgeRef}}${index === pattern.length - 1 ? "" : ","}`);
+  });
+  lines.push("};");
+  lines.push(`static k_pattern ${name} = {${pattern.length}, ${name}_nodes};`);
+  return lines.join("\n");
+}
+
 function emitValueBuilder(value, ctx) {
   if (isProduct(value)) {
     const name = `v${ctx.next++}`;
@@ -124,6 +178,7 @@ export function compileAndRunLLVM(llvm, { input, expected = null, tmpPrefix = "k
     fs.writeFileSync(llPath, llvm);
     fs.writeFileSync(driverPath, driverSource({ input, expected }));
     runCommand("clang", [
+      "-O3",
       "-Wno-override-module",
       "-Iruntime",
       "runtime/krt.c",
@@ -138,20 +193,180 @@ export function compileAndRunLLVM(llvm, { input, expected = null, tmpPrefix = "k
   }
 }
 
-export function stdioDriverSource() {
+export function stdioDriverSource({ inputPattern = null, outputPattern = null } = {}) {
+  if (inputPattern == null || outputPattern == null) {
+    return [
+      '#include "krt.h"',
+      "",
+      "extern k_result k_main(k_rt *rt, k_value *input);",
+      "",
+      "int main(void) {",
+      "  k_rt *rt = k_rt_new();",
+      "  if (rt == 0) return 1;",
+      "  k_value *input = k_read_wire(stdin, rt);",
+      "  if (input == 0) return 2;",
+      "  k_result result = k_main(rt, input);",
+      "  if (result.status != K_STATUS_OK) return 3;",
+      "  if (!k_write_wire(stdout, result.value)) return 4;",
+      "  k_rt_free(rt);",
+      "  return 0;",
+      "}",
+      ""
+    ].join("\n");
+  }
+
   return [
     '#include "krt.h"',
+    "#include <stdint.h>",
+    "#include <stdio.h>",
+    "#include <stdlib.h>",
+    "#include <string.h>",
+    "",
+    emitPattern("compiled_input_pattern", inputPattern),
+    "",
+    emitPattern("compiled_output_pattern", outputPattern),
     "",
     "extern k_result k_main(k_rt *rt, k_value *input);",
     "",
-    "int main(void) {",
+    "static int read_exact(FILE *in, unsigned char *buffer, size_t length) {",
+    "  size_t offset = 0;",
+    "  while (offset < length) {",
+    "    size_t n = fread(buffer + offset, 1, length - offset, in);",
+    "    if (n == 0) {",
+    "      if (ferror(in)) return -1;",
+    "      return offset == 0 ? 0 : -1;",
+    "    }",
+    "    offset += n;",
+    "  }",
+    "  return 1;",
+    "}",
+    "",
+    "static int write_frame(k_wire_prefix *prefix, k_pattern *pattern, k_value *value) {",
+    "  size_t length = 0;",
+    "  unsigned char *payload = k_encode_wire_as_with_prefix(prefix, pattern, value, &length);",
+    "  if (payload == NULL || length > UINT32_MAX) {",
+    "    free(payload);",
+    "    return 0;",
+    "  }",
+    "  unsigned char header[4] = {",
+    "    (unsigned char)((length >> 24) & 0xff),",
+    "    (unsigned char)((length >> 16) & 0xff),",
+    "    (unsigned char)((length >> 8) & 0xff),",
+    "    (unsigned char)(length & 0xff)",
+    "  };",
+    "  int ok = fwrite(header, 1, 4, stdout) == 4 && fwrite(payload, 1, length, stdout) == length && fflush(stdout) == 0;",
+    "  free(payload);",
+    "  return ok;",
+    "}",
+    "",
+    "static int run_value(k_rt *rt, k_wire_prefix *output_prefix, k_value *input_value) {",
+    "  k_result result = k_main(rt, input_value);",
+    "  if (result.status != K_STATUS_OK) return 3;",
+    "  return write_frame(output_prefix, &compiled_output_pattern, result.value) ? 0 : 4;",
+    "}",
+    "",
+    "static int run_payload(k_rt *rt, k_wire_prefix *input_prefix, k_wire_prefix *output_prefix, const unsigned char *payload, size_t length) {",
+    "  k_value *fast_input = k_decode_wire_value_with_prefix(payload, length, input_prefix, &compiled_input_pattern, rt);",
+    "  if (fast_input != 0) return run_value(rt, output_prefix, fast_input);",
+    "  k_wire_input input = k_decode_wire_envelope(payload, length, rt);",
+    "  if (input.value == 0 || input.pattern == 0) {",
+    "    k_wire_input_free(input);",
+    "    return 2;",
+    "  }",
+    "  if (!k_pattern_equal(input.pattern, &compiled_input_pattern)) {",
+    "    k_wire_input_free(input);",
+    "    return 5;",
+    "  }",
+    "  int status = run_value(rt, output_prefix, input.value);",
+    "  k_wire_input_free(input);",
+    "  return status;",
+    "}",
+    "",
+    "static int run_server(void) {",
     "  k_rt *rt = k_rt_new();",
     "  if (rt == 0) return 1;",
-    "  k_value *input = k_read_wire(stdin, rt);",
-    "  if (input == 0) return 2;",
-    "  k_result result = k_main(rt, input);",
-    "  if (result.status != K_STATUS_OK) return 3;",
-    "  if (!k_write_wire(stdout, result.value)) return 4;",
+    "  k_wire_prefix input_prefix = k_wire_prefix_for_pattern(&compiled_input_pattern);",
+    "  k_wire_prefix output_prefix = k_wire_prefix_for_pattern(&compiled_output_pattern);",
+    "  if (!input_prefix.ok || !output_prefix.ok) {",
+    "    k_wire_prefix_free(input_prefix);",
+    "    k_wire_prefix_free(output_prefix);",
+    "    k_rt_free(rt);",
+    "    return 8;",
+    "  }",
+    "  for (;;) {",
+    "    unsigned char header[4];",
+    "    int header_status = read_exact(stdin, header, 4);",
+    "    if (header_status == 0) {",
+    "      k_wire_prefix_free(input_prefix);",
+    "      k_wire_prefix_free(output_prefix);",
+    "      k_rt_free(rt);",
+    "      return 0;",
+    "    }",
+    "    if (header_status < 0) {",
+    "      k_wire_prefix_free(input_prefix);",
+    "      k_wire_prefix_free(output_prefix);",
+    "      k_rt_free(rt);",
+    "      return 6;",
+    "    }",
+    "    uint32_t length = ((uint32_t)header[0] << 24) | ((uint32_t)header[1] << 16) | ((uint32_t)header[2] << 8) | (uint32_t)header[3];",
+    "    unsigned char *payload = malloc(length == 0 ? 1 : length);",
+    "    if (payload == NULL) {",
+    "      k_wire_prefix_free(input_prefix);",
+    "      k_wire_prefix_free(output_prefix);",
+    "      k_rt_free(rt);",
+    "      return 7;",
+    "    }",
+    "    int payload_status = read_exact(stdin, payload, length);",
+    "    if (payload_status != 1) {",
+    "      free(payload);",
+    "      k_wire_prefix_free(input_prefix);",
+    "      k_wire_prefix_free(output_prefix);",
+    "      k_rt_free(rt);",
+    "      return 6;",
+    "    }",
+    "    int status = run_payload(rt, &input_prefix, &output_prefix, payload, length);",
+    "    free(payload);",
+    "    k_rt_reset(rt);",
+    "    if (status != 0) {",
+    "      k_wire_prefix_free(input_prefix);",
+    "      k_wire_prefix_free(output_prefix);",
+    "      k_rt_free(rt);",
+    "      return status;",
+    "    }",
+    "  }",
+    "}",
+    "",
+    "int main(int argc, char **argv) {",
+    "  if (argc == 2 && strcmp(argv[1], \"--server\") == 0) return run_server();",
+    "  k_rt *rt = k_rt_new();",
+    "  if (rt == 0) return 1;",
+    "  k_wire_prefix output_prefix = k_wire_prefix_for_pattern(&compiled_output_pattern);",
+    "  k_wire_input input = k_read_wire_envelope(stdin, rt);",
+    "  if (input.value == 0 || input.pattern == 0) {",
+    "    k_wire_prefix_free(output_prefix);",
+    "    k_rt_free(rt);",
+    "    return 2;",
+    "  }",
+    "  if (!k_pattern_equal(input.pattern, &compiled_input_pattern)) {",
+    "    k_wire_input_free(input);",
+    "    k_wire_prefix_free(output_prefix);",
+    "    k_rt_free(rt);",
+    "    return 5;",
+    "  }",
+    "  k_result result = k_main(rt, input.value);",
+    "  if (result.status != K_STATUS_OK) {",
+    "    k_wire_input_free(input);",
+    "    k_wire_prefix_free(output_prefix);",
+    "    k_rt_free(rt);",
+    "    return 3;",
+    "  }",
+    "  size_t output_length = 0;",
+    "  unsigned char *output_payload = k_encode_wire_as_with_prefix(&output_prefix, &compiled_output_pattern, result.value, &output_length);",
+    "  int ok = output_payload != NULL && fwrite(output_payload, 1, output_length, stdout) == output_length;",
+    "  free(output_payload);",
+    "  k_wire_input_free(input);",
+    "  k_wire_prefix_free(output_prefix);",
+    "  if (!ok) return 4;",
     "  k_rt_free(rt);",
     "  return 0;",
     "}",
@@ -167,6 +382,7 @@ export function compileLLVMToExecutable(llvm, outputPath, { driver = stdioDriver
     fs.writeFileSync(llPath, llvm);
     fs.writeFileSync(driverPath, driver);
     runCommand("clang", [
+      "-O3",
       "-Wno-override-module",
       "-Iruntime",
       "runtime/krt.c",
@@ -181,11 +397,16 @@ export function compileLLVMToExecutable(llvm, outputPath, { driver = stdioDriver
 }
 
 export function compileObjectToExecutable(object, outputPath, { relation = object.main, inputPattern = null } = {}) {
-  const { llvm } = compileObjectToLLVM(object, {
+  const { kirR, llvm } = compileObjectToLLVM(object, {
     relation,
     inputPattern: inputPattern || inputPatternForObjectRelation(object, relation)
   });
-  compileLLVMToExecutable(llvm, outputPath);
+  compileLLVMToExecutable(llvm, outputPath, {
+    driver: stdioDriverSource({
+      inputPattern: kirR.inputPattern,
+      outputPattern: kirR.outputPattern
+    })
+  });
 }
 
 export function compileObjectAndRun(object, { relation = object.main, input, expected = null, inputPattern = null }) {
