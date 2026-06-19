@@ -85,4 +85,19 @@ const { llvm: compositionLLVM } = compileObjectToLLVM(compositionObject, {
 assert.match(compositionLLVM, /call ptr @k_product_get\(ptr %input, ptr %label\d+\)/);
 assert.match(compositionLLVM, /call ptr @k_product_get\(ptr %field\d+, ptr %label\d+\)/);
 
+const relationObject = decodeObject(compileObjectBuffer("pick = .x; {.a pick left, .b pick right}", { source: "llvm-relation.k" }));
+const { llvm: relationLLVM } = compileObjectToLLVM(relationObject, {
+  inputPattern: [
+    ["open-product", [["a", 1], ["b", 2]]],
+    ["open-product", [["x", 3]]],
+    ["open-product", [["x", 4]]],
+    ["closed-product", []],
+    ["closed-product", []]
+  ]
+});
+assert.match(relationLLVM, /define internal %k_result @k_rel_pick_\d+\(ptr %rt, ptr %input\)/);
+assert.match(relationLLVM, /call %k_result @k_rel_pick_\d+\(ptr %rt, ptr %field\d+\)/);
+assert.match(relationLLVM, /extractvalue %k_result %call\d+, 0/);
+assert.match(relationLLVM, /extractvalue %k_result %call\d+, 1/);
+
 console.log("OK");

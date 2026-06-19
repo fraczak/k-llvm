@@ -56,4 +56,12 @@ grep -q 'call ptr @k_product_get(ptr %field' "$TMP_DIR/composition.ll"
 clang -Wno-override-module -Iruntime runtime/krt.c tests/composition-driver.c "$TMP_DIR/composition.ll" -o "$TMP_DIR/composition"
 "$TMP_DIR/composition"
 
+node ../k.kir/objects/compile.mjs 'pick = .x; {.a pick left, .b pick right}' "$TMP_DIR/relation.ko"
+printf '[["open-product",[["a",1],["b",2]]],["open-product",[["x",3]]],["open-product",[["x",4]]],["closed-product",[]],["closed-product",[]]]' > "$TMP_DIR/relation.pattern.json"
+node ./bin/k-llvm-compile.mjs --input-pattern "$TMP_DIR/relation.pattern.json" "$TMP_DIR/relation.ko" "$TMP_DIR/relation.ll"
+grep -q 'define internal %k_result @k_rel_pick' "$TMP_DIR/relation.ll"
+grep -q 'call %k_result @k_rel_pick' "$TMP_DIR/relation.ll"
+clang -Wno-override-module -Iruntime runtime/krt.c tests/relation-driver.c "$TMP_DIR/relation.ll" -o "$TMP_DIR/relation"
+"$TMP_DIR/relation"
+
 node ./bin/k-llvm-compile.mjs --help | grep -q 'Compile a k .ko/.klib object'

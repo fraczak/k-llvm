@@ -63,11 +63,11 @@ Current output:
 - identity, filter erasure, product projection/construction, and variant
   construction/projection lowerings as `@k_main(k_rt*, k_value*) -> k_result`;
 - KIR `comp` lowering for sequencing supported operations;
+- KIR `ref` lowering to internal `%k_result` relation functions;
 - a tiny C runtime under `runtime/`.
 
 Next backend steps:
 
-- lower filters and relation calls;
 - add an executable conformance mode once the runtime ABI exists.
 
 ## Runtime ABI

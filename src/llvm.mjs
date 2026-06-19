@@ -36,6 +36,10 @@ function llvmStringGlobalName(index) {
   return `@k_label_${index}`;
 }
 
+function llvmRelationFunctionName(name, index) {
+  return `@k_rel_${llvmIdentifier(name)}_${index}`;
+}
+
 function runtimeDeclarations() {
   return [
     "%k_result = type { i32, ptr }",
@@ -52,11 +56,12 @@ function runtimeDeclarations() {
   ];
 }
 
-function createLoweringContext() {
+function createLoweringContext(functionNames = new Map(), labels = new Map()) {
   return {
     temp: 0,
     block: 0,
-    labels: new Map(),
+    functionNames,
+    labels,
     lines: [],
     tempName(prefix) {
       return `%${prefix}${this.temp++}`;
@@ -108,11 +113,34 @@ function nullCheck(ctx, value) {
   ctx.lines.push(`${okBlock}:`);
 }
 
+function statusCheck(ctx, callResult) {
+  const status = ctx.tempName("status");
+  const failed = ctx.tempName("failed");
+  const okBlock = ctx.blockName("ok");
+  const failedBlock = ctx.blockName("failed");
+  ctx.lines.push(`  ${status} = extractvalue %k_result ${callResult}, 0`);
+  ctx.lines.push(`  ${failed} = icmp ne i32 ${status}, 0`);
+  ctx.lines.push(`  br i1 ${failed}, label %${failedBlock}, label %${okBlock}`);
+  ctx.lines.push(`${failedBlock}:`);
+  ctx.lines.push(...result(ctx, status));
+  ctx.lines.push(`${okBlock}:`);
+}
+
 function lowerExpr(ctx, exp, input = "%input") {
   switch (exp?.op) {
     case "identity":
     case "filter":
       return input;
+    case "ref": {
+      const functionName = ctx.functionNames.get(exp.ref);
+      if (!functionName) return null;
+      const callResult = ctx.tempName("call");
+      ctx.lines.push(`  ${callResult} = call %k_result ${functionName}(ptr %rt, ptr ${input})`);
+      statusCheck(ctx, callResult);
+      const value = ctx.tempName("ref");
+      ctx.lines.push(`  ${value} = extractvalue %k_result ${callResult}, 1`);
+      return value;
+    }
     case "dot": {
       const label = ctx.labelPointer(exp.label);
       const value = ctx.tempName("field");
@@ -171,21 +199,7 @@ function lowerExpr(ctx, exp, input = "%input") {
 }
 
 function lowerableEntryBody(kirR) {
-  const body = kirR.entry?.body;
-  if (body?.op === "ref" && body.ref === "__kir_target__" && kirR.rels?.__kir_target__?.body) {
-    return kirR.rels.__kir_target__.body;
-  }
-  return body;
-}
-
-function lowerEntryBody(kirR, ctx) {
-  const value = lowerExpr(ctx, lowerableEntryBody(kirR));
-  if (value == null) {
-    unsupported(ctx);
-    return ctx.lines;
-  }
-  ctx.lines.push(...result(ctx, 0, value));
-  return ctx.lines;
+  return kirR.entry?.body;
 }
 
 function labelGlobals(ctx) {
@@ -193,19 +207,49 @@ function labelGlobals(ctx) {
     `${label.name} = private unnamed_addr constant [${label.length} x i8] c"${cStringBytes(label.text)}", align 1`);
 }
 
-function emitFunctionBody(kirR, ctx) {
+function emitFunctionBody(symbol, body, ctx, linkage = "") {
+  const value = lowerExpr(ctx, body);
+  if (value == null) {
+    unsupported(ctx);
+  } else {
+    ctx.lines.push(...result(ctx, 0, value));
+  }
+  const prefix = linkage ? `define ${linkage} %k_result` : "define %k_result";
   return [
-    "define %k_result @k_main(ptr %rt, ptr %input) {",
+    `${prefix} ${symbol}(ptr %rt, ptr %input) {`,
     "entry:",
-    ...lowerEntryBody(kirR, ctx),
+    ...ctx.lines,
     "}",
     ""
   ];
 }
 
+function sortedRelationEntries(kirR) {
+  return Object.entries(kirR.rels || {})
+    .filter(([name]) => name !== "__main__")
+    .sort(([a], [b]) => a.localeCompare(b));
+}
+
+function relationFunctionNames(kirR) {
+  return new Map(sortedRelationEntries(kirR).map(([name], index) => [
+    name,
+    llvmRelationFunctionName(name, index)
+  ]));
+}
+
+function emitRelationFunctions(kirR, functionNames, labels) {
+  return sortedRelationEntries(kirR).flatMap(([name, rel]) => {
+    const ctx = createLoweringContext(functionNames, labels);
+    return emitFunctionBody(functionNames.get(name), rel.body, ctx, "internal");
+  });
+}
+
 export function emitLLVMModule(kirR, options = {}) {
-  const lowering = createLoweringContext();
-  const functionBody = emitFunctionBody(kirR, lowering);
+  const labels = new Map();
+  const functionNames = relationFunctionNames(kirR);
+  const relationFunctions = emitRelationFunctions(kirR, functionNames, labels);
+  const mainContext = createLoweringContext(functionNames, labels);
+  const functionBody = emitFunctionBody("@k_main", lowerableEntryBody(kirR), mainContext);
   const payload = JSON.stringify({
     format: ARTIFACT_FORMAT,
     version: ARTIFACT_VERSION,
@@ -223,10 +267,11 @@ export function emitLLVMModule(kirR, options = {}) {
     `source_filename = "k-llvm:${symbol}"`,
     "",
     `@k_llvm_metadata = private unnamed_addr constant [${payloadBytes} x i8] c"${cStringBytes(payload)}", align 1`,
-    ...labelGlobals(lowering),
+    ...labelGlobals({ labels }),
     "",
     ...runtimeDeclarations(),
     "",
+    ...relationFunctions,
     ...functionBody
   ].join("\n");
 }
