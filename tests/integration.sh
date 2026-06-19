@@ -80,3 +80,8 @@ node ../k.kir/objects/compile.mjs '.x' "$TMP_DIR/run.ko"
 printf '{"x":"left","y":"right"}' > "$TMP_DIR/run-input.kv"
 printf '"left"' > "$TMP_DIR/run-expected.kv"
 node ./bin/k-llvm-run.mjs --expect "$TMP_DIR/run-expected.kv" "$TMP_DIR/run.ko" "$TMP_DIR/run-input.kv" | grep -qx 'OK'
+node ./bin/k-llvm-run.mjs "$TMP_DIR/run.ko" "$TMP_DIR/run-input.kv" | grep -qx '"left"'
+
+node ../k.kir/objects/compile.mjs '{ .x fieldA, .y fieldB }' "$TMP_DIR/run-product.ko"
+printf '{"x":"left","y":"right"}' > "$TMP_DIR/run-product-input.kv"
+node ./bin/k-llvm-run.mjs "$TMP_DIR/run-product.ko" "$TMP_DIR/run-product-input.kv" | grep -qx '{"fieldA":"left","fieldB":"right"}'

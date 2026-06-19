@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 typedef struct k_rt k_rt;
 typedef struct k_value k_value;
@@ -30,5 +31,6 @@ const char *k_variant_tag(k_value *value);
 k_value *k_variant_payload(k_value *value);
 
 int k_equal(k_value *a, k_value *b);
+void k_print_json(FILE *out, k_value *value);
 
 #endif

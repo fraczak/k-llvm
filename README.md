@@ -55,8 +55,7 @@ Options:
 
 Only `.ko` / `.klib` object input is supported in this first prototype.
 Source compilation remains owned by core `k`.
-`k-llvm-run` currently validates execution and optional expected output; it does
-not print result values yet.
+Without `--expect`, `k-llvm-run` prints the result value as compact JSON.
 
 ## Tests
 

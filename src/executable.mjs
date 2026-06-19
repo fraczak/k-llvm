@@ -66,7 +66,10 @@ function builderFunction(name, value) {
 export function driverSource({ input, expected = null }) {
   const expectedBuilder = expected == null ? "" : builderFunction("build_expected", expected);
   const expectedCheck = expected == null
-    ? []
+    ? [
+        "  k_print_json(stdout, result.value);",
+        "  fputc('\\n', stdout);"
+      ]
     : [
         "  k_value *expected = build_expected(rt);",
         "  if (!k_equal(result.value, expected)) return 3;"
@@ -74,6 +77,7 @@ export function driverSource({ input, expected = null }) {
 
   return [
     '#include "krt.h"',
+    "#include <stdio.h>",
     "",
     "extern k_result k_main(k_rt *rt, k_value *input);",
     "",

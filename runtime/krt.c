@@ -164,3 +164,82 @@ int k_equal(k_value *a, k_value *b) {
 
   return 0;
 }
+
+static int is_empty_product(k_value *value) {
+  return value != NULL &&
+    value->kind == K_VALUE_PRODUCT &&
+    value->as.product.count == 0;
+}
+
+static void print_json_string(FILE *out, const char *text) {
+  fputc('"', out);
+  for (const unsigned char *p = (const unsigned char *)text; *p != 0; p++) {
+    switch (*p) {
+      case '"':
+        fputs("\\\"", out);
+        break;
+      case '\\':
+        fputs("\\\\", out);
+        break;
+      case '\b':
+        fputs("\\b", out);
+        break;
+      case '\f':
+        fputs("\\f", out);
+        break;
+      case '\n':
+        fputs("\\n", out);
+        break;
+      case '\r':
+        fputs("\\r", out);
+        break;
+      case '\t':
+        fputs("\\t", out);
+        break;
+      default:
+        if (*p < 0x20) {
+          fprintf(out, "\\u%04x", *p);
+        } else {
+          fputc(*p, out);
+        }
+        break;
+    }
+  }
+  fputc('"', out);
+}
+
+void k_print_json(FILE *out, k_value *value) {
+  if (value == NULL) {
+    fputs("null", out);
+    return;
+  }
+
+  if (value->kind == K_VALUE_UNIT) {
+    fputs("{}", out);
+    return;
+  }
+
+  if (value->kind == K_VALUE_PRODUCT) {
+    fputc('{', out);
+    for (size_t i = 0; i < value->as.product.count; i++) {
+      if (i > 0) fputc(',', out);
+      print_json_string(out, value->as.product.fields[i].label);
+      fputc(':', out);
+      k_print_json(out, value->as.product.fields[i].value);
+    }
+    fputc('}', out);
+    return;
+  }
+
+  if (value->kind == K_VALUE_VARIANT) {
+    if (is_empty_product(value->as.variant.payload)) {
+      print_json_string(out, value->as.variant.tag);
+      return;
+    }
+    fputc('{', out);
+    print_json_string(out, value->as.variant.tag);
+    fputc(':', out);
+    k_print_json(out, value->as.variant.payload);
+    fputc('}', out);
+  }
+}

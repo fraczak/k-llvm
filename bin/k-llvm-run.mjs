@@ -21,7 +21,7 @@ function usage(stream = console.error) {
   stream("  --expect value          Expected output value JSON/k-value text, or a file containing it.");
   stream("  -h, --help              Show this help.");
   stream("");
-  stream("This first runner validates execution and optional expected output. It does not print result values yet.");
+  stream("Without --expect, the runner prints the result value as compact JSON.");
 }
 
 async function readStdinText() {
@@ -76,13 +76,13 @@ try {
   const inputText = inputPath == null ? await readStdinText() : fs.readFileSync(inputPath, "utf8");
   const input = parseValue(inputText);
   const expected = expectedText == null ? null : parseValue(readMaybeFile(expectedText));
-  compileObjectAndRun(object, {
+  const result = compileObjectAndRun(object, {
     relation: relation || object.main,
     input,
     expected,
     inputPattern: readPattern(inputPattern)
   });
-  stdout.write("OK\n");
+  stdout.write(expected == null ? result.stdout : "OK\n");
 } catch (error) {
   console.error(error.stack || error.message || String(error));
   usage();
