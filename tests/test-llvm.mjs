@@ -60,4 +60,15 @@ assert.match(variantProjectionLLVM, /call ptr @k_variant_tag\(ptr %input\)/);
 assert.match(variantProjectionLLVM, /call i32 @strcmp\(ptr %tag\d+, ptr %label\d+\)/);
 assert.match(variantProjectionLLVM, /call ptr @k_variant_payload\(ptr %input\)/);
 
+const compositionObject = decodeObject(compileObjectBuffer("(.x .y)", { source: "llvm-composition.k" }));
+const { llvm: compositionLLVM } = compileObjectToLLVM(compositionObject, {
+  inputPattern: [
+    ["closed-product", [["x", 1]]],
+    ["closed-product", [["y", 2]]],
+    ["closed-product", []]
+  ]
+});
+assert.match(compositionLLVM, /call ptr @k_product_get\(ptr %input, ptr %label\d+\)/);
+assert.match(compositionLLVM, /call ptr @k_product_get\(ptr %field\d+, ptr %label\d+\)/);
+
 console.log("OK");

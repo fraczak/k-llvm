@@ -146,6 +146,14 @@ function lowerExpr(ctx, exp, input = "%input") {
       nullCheck(ctx, variant);
       return variant;
     }
+    case "comp": {
+      let current = input;
+      for (const item of exp.items) {
+        current = lowerExpr(ctx, item, current);
+        if (current == null) return null;
+      }
+      return current;
+    }
     case "product": {
       const product = ctx.tempName("product");
       ctx.lines.push(`  ${product} = call ptr @k_product(ptr %rt, i64 ${exp.fields.length})`);

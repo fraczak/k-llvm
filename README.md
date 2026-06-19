@@ -35,7 +35,8 @@ define %k_result @k_main(ptr %rt, ptr %input)
 `%rt` is an opaque runtime handle and `%input` is an opaque boxed `k_value*`.
 The first executable lowerings support identity, product field projection,
 product construction, variant construction, and variant projection. Unsupported
-operations return a nonzero status in `k_result`.
+operations return a nonzero status in `k_result`. These operations can compose
+through KIR `comp`.
 
 ## CLI
 
@@ -61,6 +62,7 @@ Current output:
 - boxed runtime ABI declarations;
 - identity, product projection/construction, and variant
   construction/projection lowerings as `@k_main(k_rt*, k_value*) -> k_result`;
+- KIR `comp` lowering for sequencing supported operations;
 - a tiny C runtime under `runtime/`.
 
 Next backend steps:
