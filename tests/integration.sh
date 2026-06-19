@@ -33,4 +33,19 @@ grep -q 'call void @k_product_set' "$TMP_DIR/product.ll"
 clang -Wno-override-module -Iruntime runtime/krt.c tests/product-driver.c "$TMP_DIR/product.ll" -o "$TMP_DIR/product"
 "$TMP_DIR/product"
 
+node ../k.kir/objects/compile.mjs '|tag' "$TMP_DIR/variant.ko"
+printf '[["closed-product",[]]]' > "$TMP_DIR/variant.pattern.json"
+node ./bin/k-llvm-compile.mjs --input-pattern "$TMP_DIR/variant.pattern.json" "$TMP_DIR/variant.ko" "$TMP_DIR/variant.ll"
+grep -q 'call ptr @k_variant' "$TMP_DIR/variant.ll"
+clang -Wno-override-module -Iruntime runtime/krt.c tests/variant-driver.c "$TMP_DIR/variant.ll" -o "$TMP_DIR/variant"
+"$TMP_DIR/variant"
+
+node ../k.kir/objects/compile.mjs '/tag' "$TMP_DIR/variant-projection.ko"
+printf '[["closed-union",[["tag",1]]],["closed-product",[]]]' > "$TMP_DIR/variant-projection.pattern.json"
+node ./bin/k-llvm-compile.mjs --input-pattern "$TMP_DIR/variant-projection.pattern.json" "$TMP_DIR/variant-projection.ko" "$TMP_DIR/variant-projection.ll"
+grep -q 'call ptr @k_variant_tag' "$TMP_DIR/variant-projection.ll"
+grep -q 'call ptr @k_variant_payload' "$TMP_DIR/variant-projection.ll"
+clang -Wno-override-module -Iruntime runtime/krt.c tests/variant-projection-driver.c "$TMP_DIR/variant-projection.ll" -o "$TMP_DIR/variant-projection"
+"$TMP_DIR/variant-projection"
+
 node ./bin/k-llvm-compile.mjs --help | grep -q 'Compile a k .ko/.klib object'

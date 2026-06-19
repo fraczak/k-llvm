@@ -43,4 +43,21 @@ const { llvm: productLLVM } = compileObjectToLLVM(productObject, {
 assert.match(productLLVM, /call ptr @k_product\(ptr %rt, i64 2\)/);
 assert.match(productLLVM, /call void @k_product_set\(ptr %product\d+, ptr %label\d+, ptr %field\d+\)/);
 
+const variantObject = decodeObject(compileObjectBuffer("|tag", { source: "llvm-variant.k" }));
+const { llvm: variantLLVM } = compileObjectToLLVM(variantObject, {
+  inputPattern: [["closed-product", []]]
+});
+assert.match(variantLLVM, /call ptr @k_variant\(ptr %rt, ptr %label\d+, ptr %input\)/);
+
+const variantProjectionObject = decodeObject(compileObjectBuffer("/tag", { source: "llvm-variant-projection.k" }));
+const { llvm: variantProjectionLLVM } = compileObjectToLLVM(variantProjectionObject, {
+  inputPattern: [
+    ["closed-union", [["tag", 1]]],
+    ["closed-product", []]
+  ]
+});
+assert.match(variantProjectionLLVM, /call ptr @k_variant_tag\(ptr %input\)/);
+assert.match(variantProjectionLLVM, /call i32 @strcmp\(ptr %tag\d+, ptr %label\d+\)/);
+assert.match(variantProjectionLLVM, /call ptr @k_variant_payload\(ptr %input\)/);
+
 console.log("OK");

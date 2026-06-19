@@ -47,7 +47,8 @@ function runtimeDeclarations() {
     "declare ptr @k_variant(ptr, ptr, ptr)",
     "declare ptr @k_variant_tag(ptr)",
     "declare ptr @k_variant_payload(ptr)",
-    "declare i32 @k_equal(ptr, ptr)"
+    "declare i32 @k_equal(ptr, ptr)",
+    "declare i32 @strcmp(ptr, ptr)"
   ];
 }
 
@@ -117,6 +118,33 @@ function lowerExpr(ctx, exp, input = "%input") {
       ctx.lines.push(`  ${value} = call ptr @k_product_get(ptr ${input}, ptr ${label})`);
       nullCheck(ctx, value);
       return value;
+    }
+    case "div": {
+      const label = ctx.labelPointer(exp.tag);
+      const tag = ctx.tempName("tag");
+      ctx.lines.push(`  ${tag} = call ptr @k_variant_tag(ptr ${input})`);
+      nullCheck(ctx, tag);
+      const compare = ctx.tempName("tagcmp");
+      const matches = ctx.tempName("tagmatch");
+      const matchBlock = ctx.blockName("tag_match");
+      const mismatchBlock = ctx.blockName("tag_mismatch");
+      ctx.lines.push(`  ${compare} = call i32 @strcmp(ptr ${tag}, ptr ${label})`);
+      ctx.lines.push(`  ${matches} = icmp eq i32 ${compare}, 0`);
+      ctx.lines.push(`  br i1 ${matches}, label %${matchBlock}, label %${mismatchBlock}`);
+      ctx.lines.push(`${mismatchBlock}:`);
+      ctx.lines.push(...result(ctx, 1));
+      ctx.lines.push(`${matchBlock}:`);
+      const payload = ctx.tempName("payload");
+      ctx.lines.push(`  ${payload} = call ptr @k_variant_payload(ptr ${input})`);
+      nullCheck(ctx, payload);
+      return payload;
+    }
+    case "vid": {
+      const label = ctx.labelPointer(exp.tag);
+      const variant = ctx.tempName("variant");
+      ctx.lines.push(`  ${variant} = call ptr @k_variant(ptr %rt, ptr ${label}, ptr ${input})`);
+      nullCheck(ctx, variant);
+      return variant;
     }
     case "product": {
       const product = ctx.tempName("product");
