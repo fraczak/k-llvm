@@ -32,6 +32,10 @@ export function llvmIdentifier(name) {
   return String(name || "main").replace(/[^A-Za-z0-9_$.-]/g, "_");
 }
 
+function llvmStringGlobalName(index) {
+  return `@k_label_${index}`;
+}
+
 function runtimeDeclarations() {
   return [
     "%k_result = type { i32, ptr }",
@@ -47,21 +51,124 @@ function runtimeDeclarations() {
   ];
 }
 
-function result(status, value = "null") {
+function createLoweringContext() {
+  return {
+    temp: 0,
+    block: 0,
+    labels: new Map(),
+    lines: [],
+    tempName(prefix) {
+      return `%${prefix}${this.temp++}`;
+    },
+    blockName(prefix) {
+      return `bb_${prefix}${this.block++}`;
+    },
+    labelPointer(label) {
+      const text = String(label);
+      let global = this.labels.get(text);
+      if (!global) {
+        const index = this.labels.size;
+        global = {
+          name: llvmStringGlobalName(index),
+          length: Buffer.byteLength(text, "utf8") + 1,
+          text
+        };
+        this.labels.set(text, global);
+      }
+      const pointer = this.tempName("label");
+      this.lines.push(`  ${pointer} = getelementptr inbounds [${global.length} x i8], ptr ${global.name}, i64 0, i64 0`);
+      return pointer;
+    }
+  };
+}
+
+function result(ctx, status, value = "null") {
+  const statusValue = ctx.tempName("status");
+  const resultValue = ctx.tempName("result");
   return [
-    `  %status = insertvalue %k_result undef, i32 ${status}, 0`,
-    `  %result = insertvalue %k_result %status, ptr ${value}, 1`,
-    "  ret %k_result %result"
+    `  ${statusValue} = insertvalue %k_result undef, i32 ${status}, 0`,
+    `  ${resultValue} = insertvalue %k_result ${statusValue}, ptr ${value}, 1`,
+    `  ret %k_result ${resultValue}`
   ];
 }
 
-function lowerEntryBody(kirR) {
+function unsupported(ctx) {
+  ctx.lines.push(...result(ctx, 1));
+}
+
+function nullCheck(ctx, value) {
+  const missing = ctx.tempName("missing");
+  const okBlock = ctx.blockName("ok");
+  const missingBlock = ctx.blockName("missing");
+  ctx.lines.push(`  ${missing} = icmp eq ptr ${value}, null`);
+  ctx.lines.push(`  br i1 ${missing}, label %${missingBlock}, label %${okBlock}`);
+  ctx.lines.push(`${missingBlock}:`);
+  ctx.lines.push(...result(ctx, 1));
+  ctx.lines.push(`${okBlock}:`);
+}
+
+function lowerExpr(ctx, exp, input = "%input") {
+  switch (exp?.op) {
+    case "identity":
+      return input;
+    case "dot": {
+      const label = ctx.labelPointer(exp.label);
+      const value = ctx.tempName("field");
+      ctx.lines.push(`  ${value} = call ptr @k_product_get(ptr ${input}, ptr ${label})`);
+      nullCheck(ctx, value);
+      return value;
+    }
+    case "product": {
+      const product = ctx.tempName("product");
+      ctx.lines.push(`  ${product} = call ptr @k_product(ptr %rt, i64 ${exp.fields.length})`);
+      for (const field of exp.fields) {
+        const child = lowerExpr(ctx, field.expr, input);
+        const label = ctx.labelPointer(field.label);
+        ctx.lines.push(`  call void @k_product_set(ptr ${product}, ptr ${label}, ptr ${child})`);
+      }
+      return product;
+    }
+    default:
+      return null;
+  }
+}
+
+function lowerableEntryBody(kirR) {
   const body = kirR.entry?.body;
-  if (body?.op === "identity") return result(0, "%input");
-  return result(1);
+  if (body?.op === "ref" && body.ref === "__kir_target__" && kirR.rels?.__kir_target__?.body) {
+    return kirR.rels.__kir_target__.body;
+  }
+  return body;
+}
+
+function lowerEntryBody(kirR, ctx) {
+  const value = lowerExpr(ctx, lowerableEntryBody(kirR));
+  if (value == null) {
+    unsupported(ctx);
+    return ctx.lines;
+  }
+  ctx.lines.push(...result(ctx, 0, value));
+  return ctx.lines;
+}
+
+function labelGlobals(ctx) {
+  return [...ctx.labels.values()].map((label) =>
+    `${label.name} = private unnamed_addr constant [${label.length} x i8] c"${cStringBytes(label.text)}", align 1`);
+}
+
+function emitFunctionBody(kirR, ctx) {
+  return [
+    "define %k_result @k_main(ptr %rt, ptr %input) {",
+    "entry:",
+    ...lowerEntryBody(kirR, ctx),
+    "}",
+    ""
+  ];
 }
 
 export function emitLLVMModule(kirR, options = {}) {
+  const lowering = createLoweringContext();
+  const functionBody = emitFunctionBody(kirR, lowering);
   const payload = JSON.stringify({
     format: ARTIFACT_FORMAT,
     version: ARTIFACT_VERSION,
@@ -79,14 +186,11 @@ export function emitLLVMModule(kirR, options = {}) {
     `source_filename = "k-llvm:${symbol}"`,
     "",
     `@k_llvm_metadata = private unnamed_addr constant [${payloadBytes} x i8] c"${cStringBytes(payload)}", align 1`,
+    ...labelGlobals(lowering),
     "",
     ...runtimeDeclarations(),
     "",
-    "define %k_result @k_main(ptr %rt, ptr %input) {",
-    "entry:",
-    ...lowerEntryBody(kirR),
-    "}",
-    ""
+    ...functionBody
   ].join("\n");
 }
 

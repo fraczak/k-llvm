@@ -33,8 +33,9 @@ define %k_result @k_main(ptr %rt, ptr %input)
 ```
 
 `%rt` is an opaque runtime handle and `%input` is an opaque boxed `k_value*`.
-The first executable lowering supports identity KIR. Unsupported operations
-return a nonzero status in `k_result`.
+The first executable lowerings support identity, product field projection, and
+product construction. Unsupported operations return a nonzero status in
+`k_result`.
 
 ## CLI
 
@@ -58,12 +59,12 @@ Current output:
 - KIR-R specialization through `@fraczak/k/backend-api.mjs`;
 - textual LLVM IR with embedded KIR-R JSON;
 - boxed runtime ABI declarations;
-- identity lowering as `@k_main(k_rt*, k_value*) -> k_result`;
+- identity, product projection, and product construction lowerings as
+  `@k_main(k_rt*, k_value*) -> k_result`;
 - a tiny C runtime under `runtime/`.
 
 Next backend steps:
 
-- lower product field access and construction;
 - lower variant tag/payload operations;
 - lower filters and relation calls;
 - add an executable conformance mode once the runtime ABI exists.
