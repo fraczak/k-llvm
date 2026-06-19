@@ -24,17 +24,29 @@ assert.equal(llvmIdentifier("a b/c"), "a_b_c");
 
 const filterLLVM = emitLLVMModule({
   relation: "__main__",
-  instanceKey: "__main__@filter",
+  instanceKey: "__main__@typed-evidence",
   entry: {
     body: {
-      op: "filter",
-      filter: ["closed-product", []],
+      op: "comp",
+      items: [
+        {
+          op: "filter",
+          filter: ["closed-product", []],
+          patterns: [0, 0]
+        },
+        {
+          op: "code",
+          code: "@code",
+          patterns: [0, 0]
+        }
+      ],
       patterns: [0, 0]
     }
   }
 });
 assert.match(filterLLVM, /insertvalue %k_result %status\d+, ptr %input, 1/);
 assert.doesNotMatch(filterLLVM, /k_filter/);
+assert.doesNotMatch(filterLLVM, /k_code/);
 
 const projectionObject = decodeObject(compileObjectBuffer(".x", { source: "llvm-projection.k" }));
 const { llvm: projectionLLVM } = compileObjectToLLVM(projectionObject, {

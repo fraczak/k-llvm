@@ -163,6 +163,7 @@ function lowerExpr(ctx, exp, input = "%input") {
     case "empty":
       return null;
     case "identity":
+    case "code":
     case "filter":
       return input;
     case "ref": {
