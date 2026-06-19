@@ -56,13 +56,22 @@ function runtimeDeclarations() {
   ];
 }
 
-function createLoweringContext(functionNames = new Map(), labels = new Map()) {
+function createLoweringContext(functionNames = new Map(), labels = new Map(), syntheticFunctions = []) {
   return {
     temp: 0,
     block: 0,
     functionNames,
     labels,
+    syntheticFunctions,
     lines: [],
+    addSyntheticFunction(body) {
+      const name = `@k_union_arm_${this.syntheticFunctions.length}`;
+      const index = this.syntheticFunctions.length;
+      this.syntheticFunctions.push(null);
+      const ctx = createLoweringContext(this.functionNames, this.labels, this.syntheticFunctions);
+      this.syntheticFunctions[index] = emitFunctionBody(name, body, ctx, "internal");
+      return name;
+    },
     tempName(prefix) {
       return `%${prefix}${this.temp++}`;
     },
@@ -126,8 +135,33 @@ function statusCheck(ctx, callResult) {
   ctx.lines.push(`${okBlock}:`);
 }
 
+function unionBranch(ctx, functionName, input, isLast) {
+  const callResult = ctx.tempName("union");
+  const status = ctx.tempName("status");
+  const failed = ctx.tempName("failed");
+  const successBlock = ctx.blockName("union_success");
+  const nextBlock = isLast ? null : ctx.blockName("union_next");
+  const failureBlock = isLast ? ctx.blockName("union_failure") : nextBlock;
+  ctx.lines.push(`  ${callResult} = call %k_result ${functionName}(ptr %rt, ptr ${input})`);
+  ctx.lines.push(`  ${status} = extractvalue %k_result ${callResult}, 0`);
+  ctx.lines.push(`  ${failed} = icmp ne i32 ${status}, 0`);
+  ctx.lines.push(`  br i1 ${failed}, label %${failureBlock}, label %${successBlock}`);
+  ctx.lines.push(`${successBlock}:`);
+  const value = ctx.tempName("union_value");
+  ctx.lines.push(`  ${value} = extractvalue %k_result ${callResult}, 1`);
+  ctx.lines.push(...result(ctx, 0, value));
+  if (isLast) {
+    ctx.lines.push(`${failureBlock}:`);
+    ctx.lines.push(...result(ctx, 1));
+  } else {
+    ctx.lines.push(`${nextBlock}:`);
+  }
+}
+
 function lowerExpr(ctx, exp, input = "%input") {
   switch (exp?.op) {
+    case "empty":
+      return null;
     case "identity":
     case "filter":
       return input;
@@ -193,6 +227,13 @@ function lowerExpr(ctx, exp, input = "%input") {
       }
       return product;
     }
+    case "union": {
+      if (!exp.items?.length) return null;
+      exp.items.forEach((item, index) => {
+        unionBranch(ctx, ctx.addSyntheticFunction(item), input, index === exp.items.length - 1);
+      });
+      return false;
+    }
     default:
       return null;
   }
@@ -209,7 +250,9 @@ function labelGlobals(ctx) {
 
 function emitFunctionBody(symbol, body, ctx, linkage = "") {
   const value = lowerExpr(ctx, body);
-  if (value == null) {
+  if (value === false) {
+    // The expression emitted complete control flow, including all returns.
+  } else if (value == null) {
     unsupported(ctx);
   } else {
     ctx.lines.push(...result(ctx, 0, value));
@@ -237,18 +280,15 @@ function relationFunctionNames(kirR) {
   ]));
 }
 
-function emitRelationFunctions(kirR, functionNames, labels) {
-  return sortedRelationEntries(kirR).flatMap(([name, rel]) => {
-    const ctx = createLoweringContext(functionNames, labels);
-    return emitFunctionBody(functionNames.get(name), rel.body, ctx, "internal");
-  });
-}
-
 export function emitLLVMModule(kirR, options = {}) {
   const labels = new Map();
+  const syntheticFunctions = [];
   const functionNames = relationFunctionNames(kirR);
-  const relationFunctions = emitRelationFunctions(kirR, functionNames, labels);
-  const mainContext = createLoweringContext(functionNames, labels);
+  const relationFunctions = sortedRelationEntries(kirR).flatMap(([name, rel]) => {
+    const ctx = createLoweringContext(functionNames, labels, syntheticFunctions);
+    return emitFunctionBody(functionNames.get(name), rel.body, ctx, "internal");
+  });
+  const mainContext = createLoweringContext(functionNames, labels, syntheticFunctions);
   const functionBody = emitFunctionBody("@k_main", lowerableEntryBody(kirR), mainContext);
   const payload = JSON.stringify({
     format: ARTIFACT_FORMAT,
@@ -271,6 +311,7 @@ export function emitLLVMModule(kirR, options = {}) {
     "",
     ...runtimeDeclarations(),
     "",
+    ...syntheticFunctions.flat(),
     ...relationFunctions,
     ...functionBody
   ].join("\n");

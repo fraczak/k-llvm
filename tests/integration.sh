@@ -64,4 +64,12 @@ grep -q 'call %k_result @k_rel_pick' "$TMP_DIR/relation.ll"
 clang -Wno-override-module -Iruntime runtime/krt.c tests/relation-driver.c "$TMP_DIR/relation.ll" -o "$TMP_DIR/relation"
 "$TMP_DIR/relation"
 
+node ../k.kir/objects/compile.mjs '< /x |left, /y |right >' "$TMP_DIR/union.ko"
+printf '[["closed-union",[["x",1],["y",2]]],["closed-product",[]],["closed-product",[]]]' > "$TMP_DIR/union.pattern.json"
+node ./bin/k-llvm-compile.mjs --input-pattern "$TMP_DIR/union.pattern.json" "$TMP_DIR/union.ko" "$TMP_DIR/union.ll"
+grep -q 'define internal %k_result @k_union_arm_0' "$TMP_DIR/union.ll"
+grep -q 'call %k_result @k_union_arm_1' "$TMP_DIR/union.ll"
+clang -Wno-override-module -Iruntime runtime/krt.c tests/union-driver.c "$TMP_DIR/union.ll" -o "$TMP_DIR/union"
+"$TMP_DIR/union"
+
 node ./bin/k-llvm-compile.mjs --help | grep -q 'Compile a k .ko/.klib object'

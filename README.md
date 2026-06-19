@@ -63,6 +63,7 @@ Current output:
 - identity, filter erasure, product projection/construction, and variant
   construction/projection lowerings as `@k_main(k_rt*, k_value*) -> k_result`;
 - KIR `comp` lowering for sequencing supported operations;
+- KIR `empty` failure and ordered `union` branch selection;
 - KIR `ref` lowering to internal `%k_result` relation functions;
 - a tiny C runtime under `runtime/`.
 

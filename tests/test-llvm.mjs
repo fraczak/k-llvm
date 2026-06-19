@@ -100,4 +100,29 @@ assert.match(relationLLVM, /call %k_result @k_rel_pick_\d+\(ptr %rt, ptr %field\
 assert.match(relationLLVM, /extractvalue %k_result %call\d+, 0/);
 assert.match(relationLLVM, /extractvalue %k_result %call\d+, 1/);
 
+const emptyLLVM = emitLLVMModule({
+  relation: "__main__",
+  instanceKey: "__main__@empty",
+  entry: {
+    body: {
+      op: "empty",
+      patterns: [0, 1]
+    }
+  }
+});
+assert.match(emptyLLVM, /insertvalue %k_result undef, i32 1, 0/);
+
+const unionObject = decodeObject(compileObjectBuffer("< /x |left, /y |right >", { source: "llvm-union.k" }));
+const { llvm: unionLLVM } = compileObjectToLLVM(unionObject, {
+  inputPattern: [
+    ["closed-union", [["x", 1], ["y", 2]]],
+    ["closed-product", []],
+    ["closed-product", []]
+  ]
+});
+assert.match(unionLLVM, /define internal %k_result @k_union_arm_0\(ptr %rt, ptr %input\)/);
+assert.match(unionLLVM, /define internal %k_result @k_union_arm_1\(ptr %rt, ptr %input\)/);
+assert.match(unionLLVM, /call %k_result @k_union_arm_0\(ptr %rt, ptr %input\)/);
+assert.match(unionLLVM, /call %k_result @k_union_arm_1\(ptr %rt, ptr %input\)/);
+
 console.log("OK");
