@@ -22,6 +22,20 @@ const custom = emitLLVMModule(kirR, { symbol: "rel name!" });
 assert.match(custom, /source_filename = "k-llvm:rel_name_"/);
 assert.equal(llvmIdentifier("a b/c"), "a_b_c");
 
+const filterLLVM = emitLLVMModule({
+  relation: "__main__",
+  instanceKey: "__main__@filter",
+  entry: {
+    body: {
+      op: "filter",
+      filter: ["closed-product", []],
+      patterns: [0, 0]
+    }
+  }
+});
+assert.match(filterLLVM, /insertvalue %k_result %status\d+, ptr %input, 1/);
+assert.doesNotMatch(filterLLVM, /k_filter/);
+
 const projectionObject = decodeObject(compileObjectBuffer(".x", { source: "llvm-projection.k" }));
 const { llvm: projectionLLVM } = compileObjectToLLVM(projectionObject, {
   inputPattern: [

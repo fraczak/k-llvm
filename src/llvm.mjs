@@ -111,6 +111,7 @@ function nullCheck(ctx, value) {
 function lowerExpr(ctx, exp, input = "%input") {
   switch (exp?.op) {
     case "identity":
+    case "filter":
       return input;
     case "dot": {
       const label = ctx.labelPointer(exp.label);
