@@ -32,5 +32,7 @@ k_value *k_variant_payload(k_value *value);
 
 int k_equal(k_value *a, k_value *b);
 void k_print_json(FILE *out, k_value *value);
+k_value *k_read_wire(FILE *in, k_rt *rt);
+int k_write_wire(FILE *out, k_value *value);
 
 #endif

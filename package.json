@@ -13,6 +13,7 @@
   "author": "Wojciech Fraczak",
   "license": "ISC",
   "bin": {
+    "k-llvm-build": "bin/k-llvm-build.mjs",
     "k-llvm-compile": "bin/k-llvm-compile.mjs",
     "k-llvm-run": "bin/k-llvm-run.mjs"
   },

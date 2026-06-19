@@ -20,6 +20,10 @@ function relationForObject(object, relationName = object.main) {
 
 export function inputPatternForObjectValue(object, value, relationName = object.main) {
   if (value.pattern) return value.pattern;
+  return inputPatternForObjectRelation(object, relationName);
+}
+
+export function inputPatternForObjectRelation(object, relationName = object.main) {
   const rel = relationForObject(object, relationName);
   const inputPatternId = rel.typePatternGraph.find(rel.def.patterns[0]);
   return patternToPropertyList(exportPatternGraph(rel.typePatternGraph, inputPatternId));
@@ -132,6 +136,56 @@ export function compileAndRunLLVM(llvm, { input, expected = null, tmpPrefix = "k
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+}
+
+export function stdioDriverSource() {
+  return [
+    '#include "krt.h"',
+    "",
+    "extern k_result k_main(k_rt *rt, k_value *input);",
+    "",
+    "int main(void) {",
+    "  k_rt *rt = k_rt_new();",
+    "  if (rt == 0) return 1;",
+    "  k_value *input = k_read_wire(stdin, rt);",
+    "  if (input == 0) return 2;",
+    "  k_result result = k_main(rt, input);",
+    "  if (result.status != K_STATUS_OK) return 3;",
+    "  if (!k_write_wire(stdout, result.value)) return 4;",
+    "  k_rt_free(rt);",
+    "  return 0;",
+    "}",
+    ""
+  ].join("\n");
+}
+
+export function compileLLVMToExecutable(llvm, outputPath, { driver = stdioDriverSource(), tmpPrefix = "k-llvm-build-" } = {}) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), tmpPrefix));
+  try {
+    const llPath = path.join(tmpDir, "program.ll");
+    const driverPath = path.join(tmpDir, "driver.c");
+    fs.writeFileSync(llPath, llvm);
+    fs.writeFileSync(driverPath, driver);
+    runCommand("clang", [
+      "-Wno-override-module",
+      "-Iruntime",
+      "runtime/krt.c",
+      driverPath,
+      llPath,
+      "-o",
+      outputPath
+    ]);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+export function compileObjectToExecutable(object, outputPath, { relation = object.main, inputPattern = null } = {}) {
+  const { llvm } = compileObjectToLLVM(object, {
+    relation,
+    inputPattern: inputPattern || inputPatternForObjectRelation(object, relation)
+  });
+  compileLLVMToExecutable(llvm, outputPath);
 }
 
 export function compileObjectAndRun(object, { relation = object.main, input, expected = null, inputPattern = null }) {

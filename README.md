@@ -41,6 +41,7 @@ status in `k_result`. These operations can compose through KIR `comp`.
 ## CLI
 
 ```sh
+k-llvm-build [options] object.ko output-exe
 k-llvm-compile [options] object.ko [output.ll]
 k-llvm-run [options] object.ko [input.kv]
 ```
@@ -48,7 +49,7 @@ k-llvm-run [options] object.ko [input.kv]
 Options:
 
 - `--retype rel`: relation to specialize; defaults to the object's `main`.
-- `--input-pattern json-or-file`: required KIR property-list input pattern.
+- `--input-pattern json-or-file`: KIR property-list input pattern.
 - `--expect value-or-file`: for `k-llvm-run`, compare the output value against
   expected value text.
 - `-h`, `--help`: show usage.
@@ -56,6 +57,9 @@ Options:
 Only `.ko` / `.klib` object input is supported in this first prototype.
 Source compilation remains owned by core `k`.
 Without `--expect`, `k-llvm-run` prints the result value as compact JSON.
+`k-llvm-build` emits a native executable that reads and writes the binary
+k pattern+value envelope used by `codecs/k-parse.mjs` and `codecs/k-print.mjs`.
+The native envelope codec currently supports ASCII labels and tags.
 
 ## Tests
 
