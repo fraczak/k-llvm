@@ -53,6 +53,17 @@ Options:
 Only `.ko` / `.klib` object input is supported in this first prototype.
 Source compilation remains owned by core `k`.
 
+## Tests
+
+```sh
+npm test
+node ./scripts/conformance.mjs
+```
+
+The conformance runner reuses supported fixtures from `../k.kir/conformance`,
+emits LLVM IR for each fixture, generates a small C driver for the fixture
+input and expected value, links it with `runtime/krt.c`, and runs the binary.
+
 ## Scope
 
 Current output:

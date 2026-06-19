@@ -142,5 +142,25 @@ k_value *k_variant_payload(k_value *value) {
 }
 
 int k_equal(k_value *a, k_value *b) {
-  return a == b;
+  if (a == b) return 1;
+  if (a == NULL || b == NULL) return 0;
+  if (a->kind != b->kind) return 0;
+
+  if (a->kind == K_VALUE_UNIT) return 1;
+
+  if (a->kind == K_VALUE_VARIANT) {
+    return strcmp(a->as.variant.tag, b->as.variant.tag) == 0 &&
+      k_equal(a->as.variant.payload, b->as.variant.payload);
+  }
+
+  if (a->kind == K_VALUE_PRODUCT) {
+    if (a->as.product.count != b->as.product.count) return 0;
+    for (size_t i = 0; i < a->as.product.count; i++) {
+      k_value *b_field = k_product_get(b, a->as.product.fields[i].label);
+      if (!k_equal(a->as.product.fields[i].value, b_field)) return 0;
+    }
+    return 1;
+  }
+
+  return 0;
 }

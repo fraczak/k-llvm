@@ -8,7 +8,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const node = process.execPath;
 const tests = [
   ["tests/test-llvm.mjs", node, ["tests/test-llvm.mjs"]],
-  ["tests/integration.sh", path.join(root, "tests/integration.sh"), []]
+  ["tests/integration.sh", path.join(root, "tests/integration.sh"), []],
+  ["scripts/conformance.mjs", node, ["scripts/conformance.mjs"]]
 ];
 
 for (const [name, command, args] of tests) {
