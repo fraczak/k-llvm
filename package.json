@@ -13,7 +13,8 @@
   "author": "Wojciech Fraczak",
   "license": "ISC",
   "bin": {
-    "k-llvm-compile": "bin/k-llvm-compile.mjs"
+    "k-llvm-compile": "bin/k-llvm-compile.mjs",
+    "k-llvm-run": "bin/k-llvm-run.mjs"
   },
   "dependencies": {
     "@fraczak/k": "git+https://github.com/fraczak/k.git#k.kir"

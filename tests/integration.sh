@@ -73,3 +73,10 @@ clang -Wno-override-module -Iruntime runtime/krt.c tests/union-driver.c "$TMP_DI
 "$TMP_DIR/union"
 
 node ./bin/k-llvm-compile.mjs --help | grep -q 'Compile a k .ko/.klib object'
+
+node ./bin/k-llvm-run.mjs --help | grep -q 'Compile and execute a k .ko/.klib object'
+
+node ../k.kir/objects/compile.mjs '.x' "$TMP_DIR/run.ko"
+printf '{"x":"left","y":"right"}' > "$TMP_DIR/run-input.kv"
+printf '"left"' > "$TMP_DIR/run-expected.kv"
+node ./bin/k-llvm-run.mjs --expect "$TMP_DIR/run-expected.kv" "$TMP_DIR/run.ko" "$TMP_DIR/run-input.kv" | grep -qx 'OK'

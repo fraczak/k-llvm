@@ -42,16 +42,21 @@ status in `k_result`. These operations can compose through KIR `comp`.
 
 ```sh
 k-llvm-compile [options] object.ko [output.ll]
+k-llvm-run [options] object.ko [input.kv]
 ```
 
 Options:
 
 - `--retype rel`: relation to specialize; defaults to the object's `main`.
 - `--input-pattern json-or-file`: required KIR property-list input pattern.
+- `--expect value-or-file`: for `k-llvm-run`, compare the output value against
+  expected value text.
 - `-h`, `--help`: show usage.
 
 Only `.ko` / `.klib` object input is supported in this first prototype.
 Source compilation remains owned by core `k`.
+`k-llvm-run` currently validates execution and optional expected output; it does
+not print result values yet.
 
 ## Tests
 
