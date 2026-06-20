@@ -435,7 +435,7 @@ export function stdioDriverSource({ inputPattern = null, outputPattern = null } 
   ].join("\n");
 }
 
-export function compileLLVMToExecutable(llvm, outputPath, { driver = stdioDriverSource(), tmpPrefix = "k-llvm-build-" } = {}) {
+export function compileLLVMToExecutable(llvm, outputPath, { driver = stdioDriverSource(), tmpPrefix = "k-llvm-build-", clangOpt = "-O3" } = {}) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), tmpPrefix));
   try {
     const llPath = path.join(tmpDir, "program.ll");
@@ -443,7 +443,7 @@ export function compileLLVMToExecutable(llvm, outputPath, { driver = stdioDriver
     fs.writeFileSync(llPath, llvm);
     fs.writeFileSync(driverPath, driver);
     runCommand("clang", [
-      "-O3",
+      clangOpt,
       "-Wno-override-module",
       "-Iruntime",
       "runtime/krt.c",
@@ -457,16 +457,18 @@ export function compileLLVMToExecutable(llvm, outputPath, { driver = stdioDriver
   }
 }
 
-export function compileObjectToExecutable(object, outputPath, { relation = object.main, inputPattern = null } = {}) {
+export function compileObjectToExecutable(object, outputPath, { relation = object.main, inputPattern = null, runtimeMode = "fast", clangOpt = "-O3" } = {}) {
   const { kirR, llvm } = compileObjectToLLVM(object, {
     relation,
-    inputPattern: inputPattern || inputPatternForObjectRelation(object, relation)
+    inputPattern: inputPattern || inputPatternForObjectRelation(object, relation),
+    runtimeMode
   });
   compileLLVMToExecutable(llvm, outputPath, {
     driver: stdioDriverSource({
       inputPattern: kirR.inputPattern,
       outputPattern: kirR.outputPattern
-    })
+    }),
+    clangOpt
   });
 }
 

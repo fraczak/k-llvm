@@ -49,6 +49,7 @@ struct k_rt {
   k_value *unit_cache;
   k_value *bit0_cache;
   k_value *bit1_cache;
+  int has_reusable_blocks;
 };
 
 static size_t align_size(size_t size) {
@@ -57,17 +58,23 @@ static size_t align_size(size_t size) {
 }
 
 static k_arena_block *reuse_arena_block(k_rt *rt, size_t size) {
+  if (rt == NULL || !rt->has_reusable_blocks) return NULL;
   k_arena_block **link = rt == NULL || rt->blocks == NULL ? NULL : &rt->blocks->next;
+  int saw_reusable = 0;
   while (link != NULL && *link != NULL) {
     k_arena_block *block = *link;
-    if (block->used == 0 && block->capacity >= size) {
-      *link = block->next;
-      block->next = rt->blocks;
-      rt->blocks = block;
-      return block;
+    if (block->used == 0) {
+      saw_reusable = 1;
+      if (block->capacity >= size) {
+        *link = block->next;
+        block->next = rt->blocks;
+        rt->blocks = block;
+        return block;
+      }
     }
     link = &block->next;
   }
+  rt->has_reusable_blocks = saw_reusable;
   return NULL;
 }
 
@@ -90,6 +97,10 @@ static void *rt_alloc(k_rt *rt, size_t size) {
   void *ptr = block->data + block->used;
   block->used += size;
   return ptr;
+}
+
+void *k_rt_alloc(k_rt *rt, size_t size) {
+  return rt_alloc(rt, size);
 }
 
 static void *rt_zalloc(k_rt *rt, size_t count, size_t size) {
@@ -171,12 +182,14 @@ k_rt *k_rt_new(void) {
 
 void k_rt_reset(k_rt *rt) {
   if (rt == NULL) return;
+  int has_next = rt->blocks != NULL && rt->blocks->next != NULL;
   for (k_arena_block *block = rt->blocks; block != NULL; block = block->next) {
     block->used = 0;
   }
   rt->unit_cache = NULL;
   rt->bit0_cache = NULL;
   rt->bit1_cache = NULL;
+  rt->has_reusable_blocks = has_next;
 }
 
 k_rt_checkpoint k_rt_mark(k_rt *rt) {
@@ -193,16 +206,19 @@ void k_rt_rewind(k_rt *rt, k_rt_checkpoint mark) {
     k_rt_reset(rt);
     return;
   }
+  int has_reusable = 0;
   for (k_arena_block *block = rt->blocks; block != NULL; block = block->next) {
     if (block == (k_arena_block *)mark.block) {
       block->used = mark.used;
       break;
     }
     block->used = 0;
+    has_reusable = 1;
   }
   rt->unit_cache = NULL;
   rt->bit0_cache = NULL;
   rt->bit1_cache = NULL;
+  rt->has_reusable_blocks = has_reusable;
 }
 
 void k_rt_free(k_rt *rt) {

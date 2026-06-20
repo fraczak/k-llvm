@@ -16,6 +16,7 @@ assert.match(llvm, /%k_rt_mark = type \{ ptr, i64 \}/);
 assert.match(llvm, /%k_result = type \{ i32, ptr \}/);
 assert.match(llvm, /declare %k_rt_mark @k_rt_mark\(ptr\)/);
 assert.match(llvm, /declare void @k_rt_rewind\(ptr, %k_rt_mark\)/);
+assert.match(llvm, /declare ptr @k_rt_alloc\(ptr, i64\)/);
 assert.match(llvm, /declare ptr @k_bit0\(ptr\)/);
 assert.match(llvm, /declare ptr @k_bit1\(ptr\)/);
 assert.match(llvm, /declare ptr @k_variant_borrowed_direct_n\(ptr, ptr, i64, ptr\)/);
@@ -65,8 +66,9 @@ const { llvm: projectionLLVM } = compileObjectToLLVM(projectionObject, {
     ["closed-product", []]
   ]
 });
-assert.match(projectionLLVM, /@k_label_0 = private unnamed_addr constant \[2 x i8\] c"x\\00"/);
-assert.match(projectionLLVM, /call ptr @k_product_get_at\(ptr %(?:input|tail_input), i64 0\)/);
+assert.match(projectionLLVM, /load i32, ptr %product_kind_slot\d+/);
+assert.match(projectionLLVM, /load ptr, ptr %product_fields_ptr_slot\d+/);
+assert.doesNotMatch(projectionLLVM, /call ptr @k_product_get_at\(ptr %(?:input|tail_input), i64 0\)/);
 
 const productObject = decodeObject(compileObjectBuffer("{ .x fieldA, .y fieldB }", { source: "llvm-product.k" }));
 const { llvm: productLLVM } = compileObjectToLLVM(productObject, {
@@ -76,14 +78,20 @@ const { llvm: productLLVM } = compileObjectToLLVM(productObject, {
     ["closed-product", [["valB", 2]]]
   ]
 });
-assert.match(productLLVM, /call ptr @k_product\(ptr %rt, i64 2\)/);
-assert.match(productLLVM, /call void @k_product_set_at\(ptr %product\d+, i64 \d+, ptr %label\d+, i64 \d+, ptr %field\d+\)/);
+assert.match(productLLVM, /store i32 1, ptr %i32_slot\d+/);
+assert.match(productLLVM, /store i64 2, ptr %i64_slot\d+/);
+assert.match(productLLVM, /store ptr %product_fields\d+, ptr %ptr_slot\d+/);
+assert.doesNotMatch(productLLVM, /call ptr @k_product\(ptr %rt/);
+assert.doesNotMatch(productLLVM, /call void @k_product_set_at\(ptr %product\d+/);
 
 const variantObject = decodeObject(compileObjectBuffer("|tag", { source: "llvm-variant.k" }));
 const { llvm: variantLLVM } = compileObjectToLLVM(variantObject, {
   inputPattern: [["closed-product", []]]
 });
-assert.match(variantLLVM, /call ptr @k_variant_borrowed_direct_n\(ptr %rt, ptr %label\d+, i64 3, ptr %(?:input|tail_input)\)/);
+assert.match(variantLLVM, /call ptr @k_rt_alloc\(ptr %rt, i64 40\)/);
+assert.match(variantLLVM, /store i32 2, ptr %i32_slot\d+/);
+assert.match(variantLLVM, /store ptr %(?:input|tail_input), ptr %ptr_slot\d+/);
+assert.doesNotMatch(variantLLVM, /call ptr @k_variant_borrowed_direct_n\(ptr %rt/);
 
 const variantProjectionObject = decodeObject(compileObjectBuffer("/tag", { source: "llvm-variant-projection.k" }));
 const { llvm: variantProjectionLLVM } = compileObjectToLLVM(variantProjectionObject, {
@@ -92,8 +100,12 @@ const { llvm: variantProjectionLLVM } = compileObjectToLLVM(variantProjectionObj
     ["closed-product", []]
   ]
 });
-assert.match(variantProjectionLLVM, /call i32 @k_variant_tag_matches\(ptr %(?:input|tail_input), ptr %label\d+, i64 3\)/);
-assert.match(variantProjectionLLVM, /call ptr @k_variant_payload\(ptr %(?:input|tail_input)\)/);
+assert.match(variantProjectionLLVM, /load i32, ptr %tag_kind_slot\d+/);
+assert.match(variantProjectionLLVM, /icmp eq i64 %tag_length\d+, 3/);
+assert.match(variantProjectionLLVM, /load i8, ptr %tag_byte_ptr\d+/);
+assert.match(variantProjectionLLVM, /load ptr, ptr %payload_slot\d+/);
+assert.doesNotMatch(variantProjectionLLVM, /call i32 @k_variant_tag_matches\(ptr %(?:input|tail_input)/);
+assert.doesNotMatch(variantProjectionLLVM, /call ptr @k_variant_payload\(ptr %(?:input|tail_input)\)/);
 
 const bitLLVM = emitLLVMModule({
   relation: "__main__",
@@ -116,7 +128,9 @@ const bitLLVM = emitLLVMModule({
     }
   }
 });
-assert.match(bitLLVM, /call ptr @k_bit1\(ptr %rt\)/);
+assert.match(bitLLVM, /load ptr, ptr %rt_bit1_slot\d+/);
+assert.match(bitLLVM, /store ptr %raw_alloc\d+, ptr %rt_bit1_slot\d+/);
+assert.doesNotMatch(bitLLVM, /call ptr @k_bit1\(ptr %rt\)/);
 assert.doesNotMatch(bitLLVM, /call ptr @k_unit\(ptr %rt\)/);
 assert.doesNotMatch(bitLLVM, /call ptr @k_variant_borrowed_n\(ptr %rt/);
 
@@ -141,8 +155,11 @@ const unitVariantLLVM = emitLLVMModule({
     }
   }
 });
-assert.match(unitVariantLLVM, /call ptr @k_variant_unit_borrowed_n\(ptr %rt, ptr %label\d+, i64 3\)/);
+assert.match(unitVariantLLVM, /load ptr, ptr %rt_unit_slot\d+/);
+assert.match(unitVariantLLVM, /store ptr %raw_alloc\d+, ptr %rt_unit_slot\d+/);
 assert.doesNotMatch(unitVariantLLVM, /call ptr @k_unit\(ptr %rt\)/);
+assert.match(unitVariantLLVM, /call ptr @k_rt_alloc\(ptr %rt, i64 40\)/);
+assert.doesNotMatch(unitVariantLLVM, /call ptr @k_variant_unit_borrowed_n\(ptr %rt/);
 
 const compositionObject = decodeObject(compileObjectBuffer("(.x .y)", { source: "llvm-composition.k" }));
 const { llvm: compositionLLVM } = compileObjectToLLVM(compositionObject, {
@@ -152,8 +169,9 @@ const { llvm: compositionLLVM } = compileObjectToLLVM(compositionObject, {
     ["closed-product", []]
   ]
 });
-assert.match(compositionLLVM, /call ptr @k_product_get_at\(ptr %(?:input|tail_input), i64 0\)/);
-assert.match(compositionLLVM, /call ptr @k_product_get_at\(ptr %field\d+, i64 0\)/);
+assert.match(compositionLLVM, /load ptr, ptr %product_fields_ptr_slot\d+/);
+assert.doesNotMatch(compositionLLVM, /call ptr @k_product_get_at\(ptr %(?:input|tail_input), i64 0\)/);
+assert.doesNotMatch(compositionLLVM, /call ptr @k_product_get_at\(ptr %field\d+, i64 0\)/);
 
 const relationObject = decodeObject(compileObjectBuffer("pick = .x; {.a pick left, .b pick right}", { source: "llvm-relation.k" }));
 const { llvm: relationLLVM } = compileObjectToLLVM(relationObject, {
@@ -166,7 +184,7 @@ const { llvm: relationLLVM } = compileObjectToLLVM(relationObject, {
   ]
 });
 assert.match(relationLLVM, /define internal %k_result @k_rel_pick_\d+\(ptr %rt, ptr %input\)/);
-assert.match(relationLLVM, /call %k_result @k_rel_pick_\d+\(ptr %rt, ptr %field\d+\)/);
+assert.match(relationLLVM, /call %k_result @k_rel_pick_\d+\(ptr %rt, ptr %field_value\d+\)/);
 assert.match(relationLLVM, /extractvalue %k_result %call\d+, 0/);
 assert.match(relationLLVM, /extractvalue %k_result %call\d+, 1/);
 
@@ -194,7 +212,8 @@ assert.match(unionLLVM, /define internal %k_result @k_union_arm_0\(ptr %rt, ptr 
 assert.match(unionLLVM, /define internal %k_result @k_union_arm_1\(ptr %rt, ptr %input\)/);
 assert.match(unionLLVM, /call %k_result @k_union_arm_0\(ptr %rt, ptr %input\)/);
 assert.match(unionLLVM, /call %k_result @k_union_arm_1\(ptr %rt, ptr %input\)/);
-assert.match(unionLLVM, /call %k_rt_mark @k_rt_mark\(ptr %rt\)/);
+assert.match(unionLLVM, /load ptr, ptr %mark_block_slot\d+/);
+assert.match(unionLLVM, /%rewind_fast_ok\d+ = and i1 %rewind_has_mark\d+, %rewind_same_block\d+/);
 assert.match(unionLLVM, /call void @k_rt_rewind\(ptr %rt, %k_rt_mark %mark\d+\)/);
 
 const nestedUnionObject = decodeObject(compileObjectBuffer("{ < /x |left, /y |right > z }", { source: "llvm-nested-union.k" }));
@@ -207,7 +226,8 @@ const { llvm: nestedUnionLLVM } = compileObjectToLLVM(nestedUnionObject, {
 });
 assert.match(nestedUnionLLVM, /define internal %k_result @k_union_expr_\d+\(ptr %rt, ptr %input\)/);
 assert.match(nestedUnionLLVM, /call %k_result @k_union_expr_\d+\(ptr %rt, ptr %(?:input|tail_input)\)/);
-assert.match(nestedUnionLLVM, /call void @k_product_set_at\(ptr %product\d+, i64 0, ptr %label\d+, i64 1, ptr %union_value\d+\)/);
+assert.match(nestedUnionLLVM, /store ptr %union_value\d+, ptr %ptr_slot\d+/);
+assert.doesNotMatch(nestedUnionLLVM, /call void @k_product_set_at\(ptr %product\d+/);
 assert.doesNotMatch(nestedUnionLLVM, /ptr false/);
 
 console.log("OK");

@@ -47,6 +47,8 @@ const iterations = parsePositiveIntEnv("ITERATIONS", 3);
 const llvmOnly = process.env.LLVM_ONLY === "1";
 const llvmWarmupIterations = parseNonNegativeIntEnv("LLVM_WARMUP_ITERATIONS", 1);
 const llvmProfileMainCalls = parseNonNegativeIntEnv("LLVM_PROFILE_MAIN_CALLS", 0);
+const llvmRuntimeMode = process.env.K_LLVM_IEEE_RUNTIME_MODE || "compact";
+const llvmClangOpt = process.env.K_LLVM_IEEE_CLANG_OPT || "-O0";
 const cacheDir = makeCacheDir("k-llvm-ieee-perf-");
 
 const float64Hash = state.typeAliases.float64;
@@ -111,7 +113,9 @@ for (const tc of testSuite) {
     relHash: relation.relHash,
     inputPattern: tc.inputPattern,
     cacheDir,
-    sourceLabel: "@fraczak/k/Examples/ieee.k"
+    sourceLabel: "@fraczak/k/Examples/ieee.k",
+    runtimeMode: llvmRuntimeMode,
+    clangOpt: llvmClangOpt
   });
 }
 codes.load(state.codes);
@@ -136,6 +140,8 @@ function printBenchmarkDescription() {
   console.log(`    llvm-ready cases: ${testSuite.filter(tc => tc.llvm.status === "ok").length}`);
   console.log(`    iterations: ${iterations}`);
   console.log(`    llvm warmup iterations: ${llvmWarmupIterations}`);
+  console.log(`    llvm runtime mode: ${llvmRuntimeMode}`);
+  console.log(`    llvm clang opt: ${llvmClangOpt}`);
   console.log(`    llvm cache dir: ${cacheDir}`);
   console.log(`    benchmark lanes: ${lanes.join("; ")}`);
   console.log("    conformance: kVM env-free and LLVM outputs are compared to native expected values");
