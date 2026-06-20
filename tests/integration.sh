@@ -51,8 +51,8 @@ clang -Wno-override-module -Iruntime runtime/krt.c tests/variant-projection-driv
 node ../k.kir/objects/compile.mjs '(.x .y)' "$TMP_DIR/composition.ko"
 printf '[["closed-product",[["x",1]]],["closed-product",[["y",2]]],["closed-product",[]]]' > "$TMP_DIR/composition.pattern.json"
 node ./bin/k-llvm-compile.mjs --input-pattern "$TMP_DIR/composition.pattern.json" "$TMP_DIR/composition.ko" "$TMP_DIR/composition.ll"
-grep -q 'call ptr @k_product_get_n(ptr %input' "$TMP_DIR/composition.ll"
-grep -q 'call ptr @k_product_get_n(ptr %field' "$TMP_DIR/composition.ll"
+grep -Eq 'call ptr @k_product_get_at\(ptr %(input|tail_input)' "$TMP_DIR/composition.ll"
+grep -q 'call ptr @k_product_get_at(ptr %field' "$TMP_DIR/composition.ll"
 clang -Wno-override-module -Iruntime runtime/krt.c tests/composition-driver.c "$TMP_DIR/composition.ll" -o "$TMP_DIR/composition"
 "$TMP_DIR/composition"
 

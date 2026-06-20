@@ -27,6 +27,7 @@ import {
   runExecutable,
   runKVMCase,
   runKVMIterations,
+  runLLVMMainBench,
   runNativeAwareIterations,
   runNativeFreeIterations,
   shouldStrictFail,
@@ -45,6 +46,7 @@ const values = csvEnv("VALUES", "0.5,-4,0,Infinity,-Infinity,NaN");
 const iterations = parsePositiveIntEnv("ITERATIONS", 3);
 const llvmOnly = process.env.LLVM_ONLY === "1";
 const llvmWarmupIterations = parseNonNegativeIntEnv("LLVM_WARMUP_ITERATIONS", 1);
+const llvmProfileMainCalls = parseNonNegativeIntEnv("LLVM_PROFILE_MAIN_CALLS", 0);
 const cacheDir = makeCacheDir("k-llvm-ieee-perf-");
 
 const float64Hash = state.typeAliases.float64;
@@ -176,6 +178,15 @@ if (!llvmOnly) {
 }
 console.log(`4. ${llvmLaneName().padEnd(29)} ${formatTiming(llvmResult)}`);
 console.log("==============================================================\n");
+
+if (llvmProfileMainCalls > 0) {
+  const mainBench = await runLLVMMainBench(testSuite, llvmProfileMainCalls);
+  console.log("================ LLVM k_main PROFILE =================");
+  console.log(`Profile calls per case:          ${mainBench.calls}`);
+  console.log(`LLVM-ready cases:                ${mainBench.cases}`);
+  console.log(`Equivalent iteration time:       ${mainBench.perIterationMs.toFixed(2)} ms/iteration`);
+  console.log("=======================================================\n");
+}
 
 for (const tc of testSuite) {
   if (!llvmOnly) {

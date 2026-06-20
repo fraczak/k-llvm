@@ -9,6 +9,11 @@ typedef struct k_rt k_rt;
 typedef struct k_value k_value;
 
 typedef struct {
+  void *block;
+  size_t used;
+} k_rt_checkpoint;
+
+typedef struct {
   const char *label;
   size_t label_length;
   size_t target;
@@ -53,23 +58,32 @@ typedef struct {
 
 enum {
   K_STATUS_OK = 0,
-  K_STATUS_UNSUPPORTED = 1
+  K_STATUS_UNSUPPORTED = 1,
+  K_STATUS_TAIL_CALL = 2
 };
 
 k_rt *k_rt_new(void);
 void k_rt_reset(k_rt *rt);
+k_rt_checkpoint k_rt_mark(k_rt *rt);
+void k_rt_rewind(k_rt *rt, k_rt_checkpoint mark);
 void k_rt_free(k_rt *rt);
 
 k_value *k_unit(k_rt *rt);
+k_value *k_bit0(k_rt *rt);
+k_value *k_bit1(k_rt *rt);
 k_value *k_product(k_rt *rt, size_t count);
 void k_product_set_n(k_value *product, const char *label, size_t label_length, k_value *value);
 void k_product_set_borrowed_n(k_value *product, const char *label, size_t label_length, k_value *value);
+void k_product_set_at(k_value *product, size_t index, const char *label, size_t label_length, k_value *value);
 k_value *k_product_get_n(k_value *product, const char *label, size_t label_length);
+k_value *k_product_get_at(k_value *product, size_t index);
 void k_product_set(k_value *product, const char *label, k_value *value);
 k_value *k_product_get(k_value *product, const char *label);
 
 k_value *k_variant_n(k_rt *rt, const char *tag, size_t tag_length, k_value *payload);
 k_value *k_variant_borrowed_n(k_rt *rt, const char *tag, size_t tag_length, k_value *payload);
+k_value *k_variant_borrowed_direct_n(k_rt *rt, const char *tag, size_t tag_length, k_value *payload);
+k_value *k_variant_unit_borrowed_n(k_rt *rt, const char *tag, size_t tag_length);
 k_value *k_variant(k_rt *rt, const char *tag, k_value *payload);
 const char *k_variant_tag(k_value *value);
 size_t k_variant_tag_length(k_value *value);

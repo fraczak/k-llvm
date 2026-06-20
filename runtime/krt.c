@@ -60,7 +60,7 @@ static k_arena_block *reuse_arena_block(k_rt *rt, size_t size) {
   k_arena_block **link = rt == NULL || rt->blocks == NULL ? NULL : &rt->blocks->next;
   while (link != NULL && *link != NULL) {
     k_arena_block *block = *link;
-    if (block->capacity - block->used >= size) {
+    if (block->used == 0 && block->capacity >= size) {
       *link = block->next;
       block->next = rt->blocks;
       rt->blocks = block;
@@ -141,11 +141,28 @@ static int numeric_label_index(const char *label, size_t label_length, size_t *o
 
 static k_value *alloc_value(k_rt *rt, k_value_kind kind) {
   if (rt == NULL) return NULL;
-  k_value *value = rt_zalloc(rt, 1, sizeof(k_value));
+  k_value *value = rt_alloc(rt, sizeof(k_value));
   if (value == NULL) abort();
   value->kind = kind;
   value->rt = rt;
   return value;
+}
+
+static k_value *alloc_product_value(k_rt *rt, size_t count) {
+  if (rt == NULL) return NULL;
+  size_t header_size = align_size(sizeof(k_value));
+  if (count != 0 && sizeof(k_field) > (((size_t)-1) - header_size) / count) abort();
+  size_t fields_size = count * sizeof(k_field);
+  unsigned char *memory = rt_alloc(rt, header_size + fields_size);
+  if (memory == NULL) abort();
+  k_value *product = (k_value *)memory;
+  product->kind = K_VALUE_PRODUCT;
+  product->rt = rt;
+  product->as.product.count = 0;
+  product->as.product.capacity = count;
+  product->as.product.fields = count == 0 ? NULL : (k_field *)(memory + header_size);
+  if (fields_size > 0) memset(product->as.product.fields, 0, fields_size);
+  return product;
 }
 
 k_rt *k_rt_new(void) {
@@ -155,6 +172,32 @@ k_rt *k_rt_new(void) {
 void k_rt_reset(k_rt *rt) {
   if (rt == NULL) return;
   for (k_arena_block *block = rt->blocks; block != NULL; block = block->next) {
+    block->used = 0;
+  }
+  rt->unit_cache = NULL;
+  rt->bit0_cache = NULL;
+  rt->bit1_cache = NULL;
+}
+
+k_rt_checkpoint k_rt_mark(k_rt *rt) {
+  k_rt_checkpoint mark = {0, 0};
+  if (rt == NULL || rt->blocks == NULL) return mark;
+  mark.block = rt->blocks;
+  mark.used = rt->blocks->used;
+  return mark;
+}
+
+void k_rt_rewind(k_rt *rt, k_rt_checkpoint mark) {
+  if (rt == NULL) return;
+  if (mark.block == NULL) {
+    k_rt_reset(rt);
+    return;
+  }
+  for (k_arena_block *block = rt->blocks; block != NULL; block = block->next) {
+    if (block == (k_arena_block *)mark.block) {
+      block->used = mark.used;
+      break;
+    }
     block->used = 0;
   }
   rt->unit_cache = NULL;
@@ -176,24 +219,35 @@ void k_rt_free(k_rt *rt) {
 k_value *k_unit(k_rt *rt) {
   if (rt == NULL) return NULL;
   if (rt->unit_cache != NULL) return rt->unit_cache;
-  k_value *unit = alloc_value(rt, K_VALUE_PRODUCT);
+  k_value *unit = alloc_product_value(rt, 0);
   if (unit == NULL) return NULL;
-  unit->as.product.count = 0;
-  unit->as.product.capacity = 0;
-  unit->as.product.fields = NULL;
   rt->unit_cache = unit;
   return unit;
 }
 
+static k_value *k_bit(k_rt *rt, int bit) {
+  if (rt == NULL) return NULL;
+  k_value **cache = bit ? &rt->bit1_cache : &rt->bit0_cache;
+  if (*cache != NULL) return *cache;
+  k_value *variant = alloc_value(rt, K_VALUE_VARIANT);
+  if (variant == NULL) return NULL;
+  variant->as.variant.tag = bit ? "1" : "0";
+  variant->as.variant.tag_length = 1;
+  variant->as.variant.payload = k_unit(rt);
+  *cache = variant;
+  return variant;
+}
+
+k_value *k_bit0(k_rt *rt) {
+  return k_bit(rt, 0);
+}
+
+k_value *k_bit1(k_rt *rt) {
+  return k_bit(rt, 1);
+}
+
 k_value *k_product(k_rt *rt, size_t count) {
-  k_value *product = alloc_value(rt, K_VALUE_PRODUCT);
-  if (product == NULL) return NULL;
-  product->as.product.capacity = count;
-  if (count > 0) {
-    product->as.product.fields = rt_zalloc(rt, count, sizeof(k_field));
-    if (product->as.product.fields == NULL) abort();
-  }
-  return product;
+  return alloc_product_value(rt, count);
 }
 
 k_value *k_product_get_n(k_value *product, const char *label, size_t label_length) {
@@ -209,6 +263,20 @@ k_value *k_product_get_n(k_value *product, const char *label, size_t label_lengt
     }
   }
   return NULL;
+}
+
+void k_product_set_at(k_value *product, size_t index, const char *label, size_t label_length, k_value *value) {
+  if (product == NULL || product->kind != K_VALUE_PRODUCT || label == NULL || index >= product->as.product.capacity) return;
+  k_field *field = &product->as.product.fields[index];
+  field->label = (char *)label;
+  field->label_length = label_length;
+  field->value = value;
+  if (index >= product->as.product.count) product->as.product.count = index + 1;
+}
+
+k_value *k_product_get_at(k_value *product, size_t index) {
+  if (product == NULL || product->kind != K_VALUE_PRODUCT || index >= product->as.product.count) return NULL;
+  return product->as.product.fields[index].value;
 }
 
 static void k_product_set_internal(k_value *product, const char *label, size_t label_length, k_value *value, int borrow_label) {
@@ -276,15 +344,7 @@ k_value *k_product_get(k_value *product, const char *label) {
 static k_value *k_variant_internal(k_rt *rt, const char *tag, size_t tag_length, k_value *payload, int borrow_tag) {
   if (tag == NULL) return NULL;
   if (rt != NULL && tag_length == 1 && is_empty_product(payload) && (tag[0] == '0' || tag[0] == '1')) {
-    k_value **cache = tag[0] == '0' ? &rt->bit0_cache : &rt->bit1_cache;
-    if (*cache != NULL) return *cache;
-    k_value *variant = alloc_value(rt, K_VALUE_VARIANT);
-    if (variant == NULL) return NULL;
-    variant->as.variant.tag = tag[0] == '0' ? "0" : "1";
-    variant->as.variant.tag_length = 1;
-    variant->as.variant.payload = k_unit(rt);
-    *cache = variant;
-    return variant;
+    return tag[0] == '0' ? k_bit0(rt) : k_bit1(rt);
   }
   k_value *variant = alloc_value(rt, K_VALUE_VARIANT);
   if (variant == NULL) return NULL;
@@ -300,6 +360,29 @@ k_value *k_variant_n(k_rt *rt, const char *tag, size_t tag_length, k_value *payl
 
 k_value *k_variant_borrowed_n(k_rt *rt, const char *tag, size_t tag_length, k_value *payload) {
   return k_variant_internal(rt, tag, tag_length, payload, 1);
+}
+
+k_value *k_variant_borrowed_direct_n(k_rt *rt, const char *tag, size_t tag_length, k_value *payload) {
+  if (tag == NULL) return NULL;
+  k_value *variant = alloc_value(rt, K_VALUE_VARIANT);
+  if (variant == NULL) return NULL;
+  variant->as.variant.tag = (char *)tag;
+  variant->as.variant.tag_length = tag_length;
+  variant->as.variant.payload = payload;
+  return variant;
+}
+
+k_value *k_variant_unit_borrowed_n(k_rt *rt, const char *tag, size_t tag_length) {
+  if (tag == NULL) return NULL;
+  if (rt != NULL && tag_length == 1 && (tag[0] == '0' || tag[0] == '1')) {
+    return tag[0] == '0' ? k_bit0(rt) : k_bit1(rt);
+  }
+  k_value *variant = alloc_value(rt, K_VALUE_VARIANT);
+  if (variant == NULL) return NULL;
+  variant->as.variant.tag = (char *)tag;
+  variant->as.variant.tag_length = tag_length;
+  variant->as.variant.payload = k_unit(rt);
+  return variant;
 }
 
 k_value *k_variant(k_rt *rt, const char *tag, k_value *payload) {
@@ -602,7 +685,7 @@ static k_value *decode_node(bit_reader *reader, k_pattern *pattern, size_t node_
     for (size_t i = 0; i < node->edge_count; i++) {
       k_value *child = decode_node(reader, pattern, node->edges[i].target, rt);
       if (!reader->ok) return NULL;
-      k_product_set_n(product, node->edges[i].label, node->edges[i].label_length, child);
+      k_product_set_at(product, i, node->edges[i].label, node->edges[i].label_length, child);
     }
     return product;
   }
@@ -619,7 +702,7 @@ static k_value *decode_node(bit_reader *reader, k_pattern *pattern, size_t node_
     k_pattern_edge *edge = &node->edges[ordinal];
     k_value *payload = decode_node(reader, pattern, edge->target, rt);
     if (!reader->ok) return NULL;
-    return k_variant_n(rt, edge->label, edge->label_length, payload);
+    return k_variant_borrowed_n(rt, edge->label, edge->label_length, payload);
   }
   reader->ok = 0;
   return NULL;
@@ -1051,7 +1134,14 @@ static void encode_node(bit_writer *writer, k_pattern *pattern, size_t node_id, 
       return;
     }
     for (size_t i = 0; i < node->edge_count; i++) {
-      encode_node(writer, pattern, node->edges[i].target, k_product_get_n(value, node->edges[i].label, node->edges[i].label_length));
+      k_value *child = NULL;
+      if (i < value->as.product.count &&
+          bytes_equal(value->as.product.fields[i].label, value->as.product.fields[i].label_length, node->edges[i].label, node->edges[i].label_length)) {
+        child = value->as.product.fields[i].value;
+      } else {
+        child = k_product_get_n(value, node->edges[i].label, node->edges[i].label_length);
+      }
+      encode_node(writer, pattern, node->edges[i].target, child);
     }
     return;
   }

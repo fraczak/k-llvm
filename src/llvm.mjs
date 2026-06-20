@@ -42,18 +42,27 @@ function llvmRelationFunctionName(name, index) {
 
 function runtimeDeclarations() {
   return [
+    "%k_rt_mark = type { ptr, i64 }",
     "%k_result = type { i32, ptr }",
     "",
+    "declare %k_rt_mark @k_rt_mark(ptr)",
+    "declare void @k_rt_rewind(ptr, %k_rt_mark)",
     "declare ptr @k_unit(ptr)",
+    "declare ptr @k_bit0(ptr)",
+    "declare ptr @k_bit1(ptr)",
     "declare ptr @k_product(ptr, i64)",
     "declare void @k_product_set(ptr, ptr, ptr)",
     "declare void @k_product_set_n(ptr, ptr, i64, ptr)",
     "declare void @k_product_set_borrowed_n(ptr, ptr, i64, ptr)",
+    "declare void @k_product_set_at(ptr, i64, ptr, i64, ptr)",
     "declare ptr @k_product_get(ptr, ptr)",
     "declare ptr @k_product_get_n(ptr, ptr, i64)",
+    "declare ptr @k_product_get_at(ptr, i64)",
     "declare ptr @k_variant(ptr, ptr, ptr)",
     "declare ptr @k_variant_n(ptr, ptr, i64, ptr)",
     "declare ptr @k_variant_borrowed_n(ptr, ptr, i64, ptr)",
+    "declare ptr @k_variant_borrowed_direct_n(ptr, ptr, i64, ptr)",
+    "declare ptr @k_variant_unit_borrowed_n(ptr, ptr, i64)",
     "declare ptr @k_variant_tag(ptr)",
     "declare ptr @k_variant_payload(ptr)",
     "declare i32 @k_equal(ptr, ptr)",
@@ -61,26 +70,35 @@ function runtimeDeclarations() {
   ];
 }
 
-function createLoweringContext(functionNames = new Map(), labels = new Map(), syntheticFunctions = []) {
+function createLoweringContext(functionNames = new Map(), labels = new Map(), syntheticFunctions = [], patternGraph = null, tail = {}) {
   return {
     temp: 0,
     block: 0,
     functionNames,
     labels,
     syntheticFunctions,
+    patternGraph,
+    tailRef: tail.refName || null,
+    catchTail: tail.catchTail || false,
+    tailInputSlot: tail.inputSlot || null,
+    tailLoopBlock: tail.loopBlock || null,
     lines: [],
-    addSyntheticFunction(body) {
+    addSyntheticFunction(body, tailPosition = false) {
       const name = `@k_union_arm_${this.syntheticFunctions.length}`;
       const index = this.syntheticFunctions.length;
       this.syntheticFunctions.push(null);
-      const ctx = createLoweringContext(this.functionNames, this.labels, this.syntheticFunctions);
-      this.syntheticFunctions[index] = emitFunctionBody(name, body, ctx, "internal");
+      const ctx = createLoweringContext(this.functionNames, this.labels, this.syntheticFunctions, this.patternGraph, {
+        refName: this.tailRef
+      });
+      this.syntheticFunctions[index] = emitFunctionBody(name, body, ctx, "internal", { tail: tailPosition });
       return name;
     },
-    addUnionFunction(items) {
+    addUnionFunction(items, tailPosition = false) {
       const name = `@k_union_expr_${this.syntheticFunctions.length}`;
-      const ctx = createLoweringContext(this.functionNames, this.labels, this.syntheticFunctions);
-      const body = emitUnionFunctionBody(name, items, ctx, "internal");
+      const ctx = createLoweringContext(this.functionNames, this.labels, this.syntheticFunctions, this.patternGraph, {
+        refName: this.tailRef
+      });
+      const body = emitUnionFunctionBody(name, items, ctx, "internal", { tail: tailPosition });
       this.syntheticFunctions.push(body);
       return name;
     },
@@ -105,9 +123,21 @@ function createLoweringContext(functionNames = new Map(), labels = new Map(), sy
       }
       const pointer = this.tempName("label");
       this.lines.push(`  ${pointer} = getelementptr inbounds [${global.length} x i8], ptr ${global.name}, i64 0, i64 0`);
-      return { pointer, length: global.byteLength };
+      return { pointer, length: global.byteLength, text };
     }
   };
+}
+
+function patternNode(ctx, patternId) {
+  if (patternId == null || ctx.patternGraph?.nodes == null) return null;
+  return ctx.patternGraph.nodes.find((node) => node.id === patternId) || null;
+}
+
+function patternEdgeIndex(ctx, patternId, label) {
+  const node = patternNode(ctx, patternId);
+  const edges = node?.edges;
+  if (!Array.isArray(edges)) return -1;
+  return edges.findIndex((edge) => edge.label === label);
 }
 
 function result(ctx, status, value = "null") {
@@ -144,39 +174,64 @@ function statusCheck(ctx, callResult) {
   ctx.lines.push(`  ${failed} = icmp ne i32 ${status}, 0`);
   ctx.lines.push(`  br i1 ${failed}, label %${failedBlock}, label %${okBlock}`);
   ctx.lines.push(`${failedBlock}:`);
-  ctx.lines.push(...result(ctx, status));
+  if (ctx.catchTail) {
+    const isTail = ctx.tempName("tail_status");
+    const tailBlock = ctx.blockName("tail");
+    const returnBlock = ctx.blockName("return_failed");
+    ctx.lines.push(`  ${isTail} = icmp eq i32 ${status}, 2`);
+    ctx.lines.push(`  br i1 ${isTail}, label %${tailBlock}, label %${returnBlock}`);
+    ctx.lines.push(`${tailBlock}:`);
+    const tailInput = ctx.tempName("tail_input");
+    ctx.lines.push(`  ${tailInput} = extractvalue %k_result ${callResult}, 1`);
+    ctx.lines.push(`  store ptr ${tailInput}, ptr ${ctx.tailInputSlot}`);
+    ctx.lines.push(`  br label %${ctx.tailLoopBlock}`);
+    ctx.lines.push(`${returnBlock}:`);
+  }
+  ctx.lines.push(`  ret %k_result ${callResult}`);
   ctx.lines.push(`${okBlock}:`);
 }
 
 function unionBranch(ctx, functionName, input, isLast) {
+  const mark = ctx.tempName("mark");
   const callResult = ctx.tempName("union");
   const status = ctx.tempName("status");
   const failed = ctx.tempName("failed");
   const successBlock = ctx.blockName("union_success");
+  const failedDispatchBlock = ctx.blockName("union_failed");
+  const tailBlock = ctx.blockName("union_tail");
   const nextBlock = isLast ? null : ctx.blockName("union_next");
   const failureBlock = isLast ? ctx.blockName("union_failure") : nextBlock;
+  ctx.lines.push(`  ${mark} = call %k_rt_mark @k_rt_mark(ptr %rt)`);
   ctx.lines.push(`  ${callResult} = call %k_result ${functionName}(ptr %rt, ptr ${input})`);
   ctx.lines.push(`  ${status} = extractvalue %k_result ${callResult}, 0`);
   ctx.lines.push(`  ${failed} = icmp ne i32 ${status}, 0`);
-  ctx.lines.push(`  br i1 ${failed}, label %${failureBlock}, label %${successBlock}`);
+  ctx.lines.push(`  br i1 ${failed}, label %${failedDispatchBlock}, label %${successBlock}`);
+  ctx.lines.push(`${failedDispatchBlock}:`);
+  const isTail = ctx.tempName("tail_status");
+  ctx.lines.push(`  ${isTail} = icmp eq i32 ${status}, 2`);
+  ctx.lines.push(`  br i1 ${isTail}, label %${tailBlock}, label %${failureBlock}`);
+  ctx.lines.push(`${tailBlock}:`);
+  ctx.lines.push(`  ret %k_result ${callResult}`);
   ctx.lines.push(`${successBlock}:`);
   const value = ctx.tempName("union_value");
   ctx.lines.push(`  ${value} = extractvalue %k_result ${callResult}, 1`);
   ctx.lines.push(...result(ctx, 0, value));
   if (isLast) {
     ctx.lines.push(`${failureBlock}:`);
+    ctx.lines.push(`  call void @k_rt_rewind(ptr %rt, %k_rt_mark ${mark})`);
     ctx.lines.push(...result(ctx, 1));
   } else {
     ctx.lines.push(`${nextBlock}:`);
+    ctx.lines.push(`  call void @k_rt_rewind(ptr %rt, %k_rt_mark ${mark})`);
   }
 }
 
-function emitUnionFunctionBody(symbol, items, ctx, linkage = "") {
+function emitUnionFunctionBody(symbol, items, ctx, linkage = "", options = {}) {
   if (!items?.length) {
     unsupported(ctx);
   } else {
     items.forEach((item, index) => {
-      unionBranch(ctx, ctx.addSyntheticFunction(item), "%input", index === items.length - 1);
+      unionBranch(ctx, ctx.addSyntheticFunction(item, options.tail === true), "%input", index === items.length - 1);
     });
   }
   const prefix = linkage ? `define ${linkage} %k_result` : "define %k_result";
@@ -189,7 +244,78 @@ function emitUnionFunctionBody(symbol, items, ctx, linkage = "") {
   ];
 }
 
-function lowerExpr(ctx, exp, input = "%input") {
+function isTailNeutral(exp) {
+  if (exp == null) return false;
+  if (exp.op === "identity" || exp.op === "code" || exp.op === "filter") return true;
+  return exp.op === "comp" && exp.items.every(isTailNeutral);
+}
+
+function isTailSelfRef(exp, ctx) {
+  return exp?.op === "ref" && exp.ref === ctx.tailRef;
+}
+
+function hasTailSelfRefSuffix(items, index, ctx) {
+  let seenSelfRef = false;
+  for (let i = index; i < items.length; i++) {
+    const item = items[i];
+    if (!seenSelfRef && isTailSelfRef(item, ctx)) {
+      seenSelfRef = true;
+      continue;
+    }
+    if (!isTailNeutral(item)) return false;
+  }
+  return seenSelfRef;
+}
+
+function lowerTailSelfRef(ctx, input) {
+  if (ctx.catchTail) {
+    ctx.lines.push(`  store ptr ${input}, ptr ${ctx.tailInputSlot}`);
+    ctx.lines.push(`  br label %${ctx.tailLoopBlock}`);
+  } else {
+    ctx.lines.push(...result(ctx, 2, input));
+  }
+  return false;
+}
+
+function lowerTailSelfProduct(ctx, exp, input) {
+  const outputNode = patternNode(ctx, exp.patterns?.[1]);
+  const edges = outputNode?.edges;
+  if (!Array.isArray(edges) || edges.length !== exp.fields.length) return null;
+
+  const seen = new Set();
+  const fields = [];
+  for (const field of exp.fields) {
+    const edgeIndex = patternEdgeIndex(ctx, exp.patterns?.[1], field.label);
+    if (edgeIndex < 0 || seen.has(edgeIndex)) return null;
+    seen.add(edgeIndex);
+    const child = lowerExpr(ctx, field.expr, input);
+    if (child === false || child == null) return child;
+    fields.push({ field, edgeIndex, child });
+  }
+  if (seen.size !== edges.length) return null;
+
+  for (const { field, edgeIndex, child } of fields) {
+    const label = ctx.labelRef(field.label);
+    ctx.lines.push(`  call void @k_product_set_at(ptr ${input}, i64 ${edgeIndex}, ptr ${label.pointer}, i64 ${label.length}, ptr ${child})`);
+  }
+  return lowerTailSelfRef(ctx, input);
+}
+
+function lowerUnitVariantConstant(ctx, tag) {
+  if (tag === "0" || tag === "1") {
+    const bit = ctx.tempName("bit");
+    ctx.lines.push(`  ${bit} = call ptr @k_bit${tag}(ptr %rt)`);
+    nullCheck(ctx, bit);
+    return bit;
+  }
+  const label = ctx.labelRef(tag);
+  const variant = ctx.tempName("variant");
+  ctx.lines.push(`  ${variant} = call ptr @k_variant_unit_borrowed_n(ptr %rt, ptr ${label.pointer}, i64 ${label.length})`);
+  nullCheck(ctx, variant);
+  return variant;
+}
+
+function lowerExpr(ctx, exp, input = "%input", options = {}) {
   switch (exp?.op) {
     case "empty":
       return null;
@@ -200,6 +326,9 @@ function lowerExpr(ctx, exp, input = "%input") {
     case "ref": {
       const functionName = ctx.functionNames.get(exp.ref);
       if (!functionName) return null;
+      if (options.tail === true && exp.ref === ctx.tailRef) {
+        return lowerTailSelfRef(ctx, input);
+      }
       const callResult = ctx.tempName("call");
       ctx.lines.push(`  ${callResult} = call %k_result ${functionName}(ptr %rt, ptr ${input})`);
       statusCheck(ctx, callResult);
@@ -210,7 +339,12 @@ function lowerExpr(ctx, exp, input = "%input") {
     case "dot": {
       const label = ctx.labelRef(exp.label);
       const value = ctx.tempName("field");
-      ctx.lines.push(`  ${value} = call ptr @k_product_get_n(ptr ${input}, ptr ${label.pointer}, i64 ${label.length})`);
+      const edgeIndex = patternEdgeIndex(ctx, exp.patterns?.[0], exp.label);
+      if (edgeIndex >= 0) {
+        ctx.lines.push(`  ${value} = call ptr @k_product_get_at(ptr ${input}, i64 ${edgeIndex})`);
+      } else {
+        ctx.lines.push(`  ${value} = call ptr @k_product_get_n(ptr ${input}, ptr ${label.pointer}, i64 ${label.length})`);
+      }
       nullCheck(ctx, value);
       return value;
     }
@@ -234,14 +368,27 @@ function lowerExpr(ctx, exp, input = "%input") {
     case "vid": {
       const label = ctx.labelRef(exp.tag);
       const variant = ctx.tempName("variant");
-      ctx.lines.push(`  ${variant} = call ptr @k_variant_borrowed_n(ptr %rt, ptr ${label.pointer}, i64 ${label.length}, ptr ${input})`);
+      ctx.lines.push(`  ${variant} = call ptr @k_variant_borrowed_direct_n(ptr %rt, ptr ${label.pointer}, i64 ${label.length}, ptr ${input})`);
       nullCheck(ctx, variant);
       return variant;
     }
     case "comp": {
       let current = input;
-      for (const item of exp.items) {
-        current = lowerExpr(ctx, item, current);
+      for (let index = 0; index < exp.items.length; index++) {
+        const item = exp.items[index];
+        const next = exp.items[index + 1];
+        if (item?.op === "product" && item.fields.length === 0 && next?.op === "vid") {
+          current = lowerUnitVariantConstant(ctx, next.tag);
+          index++;
+          continue;
+        }
+        if (options.tail === true && item?.op === "product" && hasTailSelfRefSuffix(exp.items, index + 1, ctx)) {
+          const tailProduct = lowerTailSelfProduct(ctx, item, current);
+          if (tailProduct !== null) return tailProduct;
+        }
+        const tail = options.tail === true && exp.items.slice(index + 1).every(isTailNeutral);
+        current = lowerExpr(ctx, item, current, { tail });
+        if (current === false) return false;
         if (current == null) return null;
       }
       return current;
@@ -259,13 +406,18 @@ function lowerExpr(ctx, exp, input = "%input") {
         const child = lowerExpr(ctx, field.expr, input);
         if (child == null) return null;
         const label = ctx.labelRef(field.label);
-        ctx.lines.push(`  call void @k_product_set_borrowed_n(ptr ${product}, ptr ${label.pointer}, i64 ${label.length}, ptr ${child})`);
+        const edgeIndex = patternEdgeIndex(ctx, exp.patterns?.[1], field.label);
+        if (edgeIndex >= 0) {
+          ctx.lines.push(`  call void @k_product_set_at(ptr ${product}, i64 ${edgeIndex}, ptr ${label.pointer}, i64 ${label.length}, ptr ${child})`);
+        } else {
+          ctx.lines.push(`  call void @k_product_set_borrowed_n(ptr ${product}, ptr ${label.pointer}, i64 ${label.length}, ptr ${child})`);
+        }
       }
       return product;
     }
     case "union": {
       if (!exp.items?.length) return null;
-      const functionName = ctx.addUnionFunction(exp.items);
+      const functionName = ctx.addUnionFunction(exp.items, options.tail === true);
       const callResult = ctx.tempName("union");
       ctx.lines.push(`  ${callResult} = call %k_result ${functionName}(ptr %rt, ptr ${input})`);
       statusCheck(ctx, callResult);
@@ -287,8 +439,18 @@ function labelGlobals(ctx) {
     `${label.name} = private unnamed_addr constant [${label.length} x i8] c"${cStringBytes(label.text)}", align 1`);
 }
 
-function emitFunctionBody(symbol, body, ctx, linkage = "") {
-  const value = lowerExpr(ctx, body);
+function emitFunctionBody(symbol, body, ctx, linkage = "", options = {}) {
+  const input = ctx.catchTail ? "%tail_input" : "%input";
+  if (ctx.catchTail) {
+    ctx.tailInputSlot = "%tail_input_slot";
+    ctx.tailLoopBlock = "tail_loop";
+    ctx.lines.push(`  ${ctx.tailInputSlot} = alloca ptr`);
+    ctx.lines.push(`  store ptr %input, ptr ${ctx.tailInputSlot}`);
+    ctx.lines.push(`  br label %${ctx.tailLoopBlock}`);
+    ctx.lines.push(`${ctx.tailLoopBlock}:`);
+    ctx.lines.push(`  ${input} = load ptr, ptr ${ctx.tailInputSlot}`);
+  }
+  const value = lowerExpr(ctx, body, input, { tail: options.tail !== false });
   if (value === false) {
     // The expression emitted complete control flow, including all returns.
   } else if (value == null) {
@@ -324,10 +486,13 @@ export function emitLLVMModule(kirR, options = {}) {
   const syntheticFunctions = [];
   const functionNames = relationFunctionNames(kirR);
   const relationFunctions = sortedRelationEntries(kirR).flatMap(([name, rel]) => {
-    const ctx = createLoweringContext(functionNames, labels, syntheticFunctions);
+    const ctx = createLoweringContext(functionNames, labels, syntheticFunctions, rel.patternGraph || null, {
+      refName: name,
+      catchTail: true
+    });
     return emitFunctionBody(functionNames.get(name), rel.body, ctx, "internal");
   });
-  const mainContext = createLoweringContext(functionNames, labels, syntheticFunctions);
+  const mainContext = createLoweringContext(functionNames, labels, syntheticFunctions, kirR.entry?.patternGraph || null);
   const functionBody = emitFunctionBody("@k_main", lowerableEntryBody(kirR), mainContext);
   const payload = JSON.stringify({
     format: ARTIFACT_FORMAT,

@@ -87,9 +87,9 @@ load the real example programs from `@fraczak/k`, generate the same operation
 matrices, compare backend output to native `k` results, and time the native JS,
 kVM, and LLVM executable lanes. Set `LLVM_ONLY=1` to skip native timing,
 `ITERATIONS=N` to change samples, and `LLVM_STRICT=1` to make unsupported LLVM
-cases fail the process. The LLVM lane uses persistent, pipelined executables by
-default; set `LLVM_SPAWN_PER_CALL=1` to reproduce the older
-spawn-per-operation timing.
+cases fail the process. The LLVM lane uses persistent executables by default;
+set `LLVM_PIPELINE=1` to measure parallel request pipelining or
+`LLVM_SPAWN_PER_CALL=1` to reproduce the older spawn-per-operation timing.
 
 ## Scope
 

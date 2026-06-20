@@ -170,6 +170,35 @@ export function runExecutable(exePath, inputWire) {
   });
 }
 
+export function runExecutableMainBench(exePath, inputWire, calls) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(exePath, ["--bench-main", String(calls)], { stdio: ["pipe", "ignore", "pipe"] });
+    const stderr = [];
+
+    child.stderr.on("data", chunk => stderr.push(chunk));
+    child.on("error", reject);
+    child.on("close", status => {
+      const text = Buffer.concat(stderr).toString("utf8");
+      if (status !== 0) {
+        reject(new Error(`${exePath} --bench-main failed with status ${status}\n${text}`.trim()));
+        return;
+      }
+      const match = text.match(/K_LLVM_BENCH_MAIN calls=(\d+) total_ns=(\d+) per_call_ns=([0-9.]+)/);
+      if (!match) {
+        reject(new Error(`${exePath} --bench-main did not report timing\n${text}`.trim()));
+        return;
+      }
+      resolve({
+        calls: Number(match[1]),
+        totalNs: Number(match[2]),
+        perCallNs: Number(match[3])
+      });
+    });
+
+    child.stdin.end(inputWire);
+  });
+}
+
 class PersistentExecutable {
   constructor(exePath) {
     this.exePath = exePath;
@@ -346,11 +375,17 @@ function createLLVMPersistentRunner(testSuite) {
     async run(iterations) {
       if (llvmCases.length === 0) return null;
       return runTimedIterationsAsync(iterations, async () => {
-        const pending = [];
-        for (const tc of llvmCases) {
-          pending.push(serverFor(tc.llvm.exePath).request(tc.inputWire));
+        if (process.env.LLVM_PIPELINE === "1") {
+          const pending = [];
+          for (const tc of llvmCases) {
+            pending.push(serverFor(tc.llvm.exePath).request(tc.inputWire));
+          }
+          await Promise.all(pending);
+          return;
         }
-        await Promise.all(pending);
+        for (const tc of llvmCases) {
+          await serverFor(tc.llvm.exePath).request(tc.inputWire);
+        }
       });
     },
     close() {
@@ -380,9 +415,28 @@ export async function runLLVMIterations(iterations, testSuite) {
   }
 }
 
+export async function runLLVMMainBench(testSuite, calls) {
+  const llvmCases = testSuite.filter(tc => tc.llvm?.status === "ok");
+  if (llvmCases.length === 0) return null;
+  const results = [];
+  for (const tc of llvmCases) {
+    const timing = await runExecutableMainBench(tc.llvm.exePath, tc.inputWire, calls);
+    results.push({ testCase: tc, timing });
+  }
+  const totalNs = results.reduce((sum, item) => sum + item.timing.totalNs, 0);
+  return {
+    calls,
+    cases: results.length,
+    totalNs,
+    perIterationMs: totalNs / calls / 1000000,
+    results
+  };
+}
+
 export function llvmLaneName() {
-  return process.env.LLVM_SPAWN_PER_CALL === "1"
-    ? "LLVM Executable (spawn/call)"
+  if (process.env.LLVM_SPAWN_PER_CALL === "1") return "LLVM Executable (spawn/call)";
+  return process.env.LLVM_PIPELINE === "1"
+    ? "LLVM Executable (persistent, pipelined)"
     : "LLVM Executable (persistent)";
 }
 

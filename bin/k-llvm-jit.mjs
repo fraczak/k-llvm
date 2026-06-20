@@ -6,9 +6,12 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { argv, exit, stdin, stdout } from "node:process";
+import { fileURLToPath } from "node:url";
 import { decodeObject } from "@fraczak/k/object.mjs";
 import { decodeWire } from "@fraczak/k/codecs/runtime/prefix-codec.mjs";
 import { compileObjectToExecutable } from "../src/executable.mjs";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function usage(stream = console.error) {
   const prog = argv[1] || "k-llvm-jit.mjs";
@@ -33,9 +36,26 @@ async function readStdinBuffer() {
   return Buffer.concat(chunks);
 }
 
+let cachedBackendFingerprint = null;
+
+function backendFingerprint() {
+  if (cachedBackendFingerprint != null) return cachedBackendFingerprint;
+  const hash = crypto.createHash("sha256");
+  for (const relPath of ["src/llvm.mjs", "src/executable.mjs", "runtime/krt.c", "runtime/krt.h"]) {
+    hash.update(relPath);
+    hash.update("\0");
+    hash.update(fs.readFileSync(path.join(root, relPath)));
+    hash.update("\0");
+  }
+  cachedBackendFingerprint = hash.digest("hex").slice(0, 16);
+  return cachedBackendFingerprint;
+}
+
 function cacheKey({ objectBuffer, relation, inputPattern }) {
   const hash = crypto.createHash("sha256");
-  hash.update("k-llvm-jit-v1\0");
+  hash.update("k-llvm-jit-v2\0");
+  hash.update(backendFingerprint());
+  hash.update("\0");
   hash.update(relation);
   hash.update("\0");
   hash.update(JSON.stringify(inputPattern));
